@@ -38,6 +38,18 @@ Add `--dry-run` to see what would change without touching anything.
    Numbers that have an IRNoti route are handled by the platform. Numbers without a route continue in the context you named as the "fallback context" when the agent was created (or are hung up if you gave none).
 4. In the panel the agent should show **Online** and **ARI connected**. Bind a VoIP number to the new server and configure its route.
 
+### Install from a package (RPM / DEB)
+
+Each release also contains `.rpm` and `.deb` packages for amd64 and arm64 (listed in `SHA256SUMS`). They install only the binary to `/usr/bin/irnoti-asterisk`; you then run `irnoti-asterisk install --api URL --token TOKEN` yourself, because the token is not known at package time.
+
+```bash
+sudo rpm -ivh irnoti-asterisk-<version>-1.x86_64.rpm      # CentOS / Rocky / Issabel / FreePBX
+sudo dpkg -i  irnoti-asterisk_<version>_amd64.deb          # Debian / Ubuntu
+sudo irnoti-asterisk install --api https://api.example.com --token irna_xxxxxxxxxxxxxxxx
+```
+
+Removing the package does not touch the Asterisk configuration; run `irnoti-asterisk uninstall` first if you want that undone.
+
 ## What the installer changes
 
 | Where | What |
@@ -122,6 +134,7 @@ Requires Go 1.24 or newer.
 ```bash
 go vet ./... && go test ./... -race
 make build        # static binaries for linux/amd64 and linux/arm64 in dist/, with SHA256SUMS
+make packages     # also .rpm and .deb (needs nfpm); then scripts/test-packages.sh installs them in Rocky 8, CentOS 7 and Debian 12 containers (needs Docker)
 ```
 
 Layout:
@@ -135,8 +148,9 @@ internal/tunnel/        the daemon: polling, events, heartbeat, config sync
 internal/installer/     config writer: managed blocks, backups, rollback, dialplan validation, systemd unit
 internal/config/        the agent's own settings file
 scripts/install.sh      the curl|bash installer
+packaging/nfpm.yaml     RPM/DEB definition
 ```
 
 The only third-party dependency is `github.com/coder/websocket` (for the ARI event stream).
 
-Releases: push a tag `vX.Y.Z`; the CI workflow runs the tests, builds the static binaries and attaches them and `SHA256SUMS` to the GitHub release.
+Releases: push a tag `vX.Y.Z`; the CI workflow runs the tests, builds the static binaries and attaches them, the `.rpm`/`.deb` packages and `SHA256SUMS` to the GitHub release.

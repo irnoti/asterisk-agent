@@ -1,0 +1,19 @@
+# Built by `make packages` (see Makefile), which copies the right binary to dist/stage/ first (nfpm does not expand env vars in `src`).
+# GOARCH and PKG_VERSION come from the environment.
+# The package ships only the binary: `irnoti-asterisk install` needs the agent token, so it is run by the administrator afterwards.
+name: irnoti-asterisk
+arch: ${GOARCH}
+platform: linux
+version: ${PKG_VERSION}
+section: net
+maintainer: IRNoti <support@irnoti.com>
+description: |
+  Agent that connects an Asterisk PBX to the IRNoti VoIP platform.
+  It configures ARI and the dialplan automatically and tunnels ARI over outbound HTTPS.
+  After installing, run: irnoti-asterisk install --api URL --token TOKEN
+homepage: https://github.com/irnoti/asterisk-agent
+contents:
+  - src: dist/stage/irnoti-asterisk
+    dst: /usr/bin/irnoti-asterisk
+    file_info:
+      mode: 0755
