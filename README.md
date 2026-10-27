@@ -119,7 +119,7 @@ Skip this whole section if you do not use the browser phone: calls, IVR, campaig
   - **Asterisk ends TLS** (`--cert`/`--key`): a certificate the browser trusts for the domain (full chain + private key, PEM). A self-signed or CDN "origin" certificate is not trusted when the browser connects directly.
   - **A CDN or reverse proxy ends TLS** (`--behind-proxy`): no certificate on the PBX. The browser connects to `wss://your-domain/ws`, the CDN opens it and passes a plain WebSocket to the PBX (see below).
 - MySQL/MariaDB on the PBX (or reachable from it) and a MySQL/MariaDB **ODBC driver** registered (`odbcinst -q -d`).
-- `python3` and outbound HTTPS to `downloads.asterisk.org` (the script downloads Asterisk's own database migrations); or pass `--ast-source DIR` with a source tree.
+- Nothing else to install for the tables: the script downloads a **prebuilt, checksum-pinned** SQL file for your Asterisk version from this repository (`scripts/pjsip-schema/`, raw.githubusercontent.com). Only if none exists for your version does it fall back to Asterisk's own migrations, which need `python3` with `venv`/`pip` and access to `downloads.asterisk.org`.
 - On **Asterisk 16, `chan_sip` must not be loaded.** `chan_sip` claims the WebSocket protocol name `sip`, so PJSIP's WebSocket transport (`res_pjsip_transport_websocket`) refuses to start while it is loaded. The signature in `/var/log/asterisk/full` is `Registered SIP service WebSocket Transport Module` immediately followed by `Unregistered SIP service WebSocket Transport Module`. Disabling `chan_sip` stops every extension and trunk that uses it (typical on Issabel/Elastix), so do it on a test PBX, after moving them to PJSIP, or use a separate Asterisk for IRNoti. Asterisk 20+ no longer ships `chan_sip`.
 
 ### Run it
@@ -143,7 +143,9 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 | `--db-name`, `--db-user`, `--db-pass` | Database and user for the PJSIP tables (default `irnoti_pjsip`; the password is generated when omitted). Only letters, digits, `_`, `.`, `-`. |
 | `--mysql-root-pass` | MySQL root password. Otherwise it is read from `/etc/issabel.conf` if present, then a plain `root` login is tried. |
 | `--skip-db` | Do not create the database or tables (they exist); only wire ODBC and the config files. |
-| `--ast-source DIR` | Use this Asterisk source tree for `contrib/ast-db-manage` instead of downloading it. |
+| `--schema-sql FILE` | Create the tables from this SQL file instead of the prebuilt one (it may only contain table creation; anything else is refused because it runs as the database root). |
+| `--no-prebuilt-schema` | Do not download the prebuilt file; run Asterisk's migrations on this PBX (needs `python3`). |
+| `--ast-source DIR` | With the migrations: use this Asterisk source tree for `contrib/ast-db-manage` instead of downloading it. |
 | `--stun HOST:PORT` | STUN server for ICE (`rtp.conf`). |
 | `--restart` | Restart Asterisk at the end. `noload` and the realtime mapping only take effect after a restart (a reload is not enough). |
 | `--check` | Report the state (Asterisk version, module states, transports, ODBC); change nothing. |
@@ -163,19 +165,13 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 
 Anything already configured by hand is left untouched and listed under "Needs your attention" at the end.
 
-### Schema without python on the PBX (`--schema-sql`)
+### Table schema (prebuilt)
 
-The `ps_*` tables come from Asterisk's own alembic migrations. If the PBX cannot install python3 (for example a CentOS 7 box whose repositories are unreachable), generate the SQL on any other machine with python 3 and hand it to the script. Use the same Asterisk version as the PBX (`asterisk -V`):
+The `ps_*` tables must match what the running Asterisk reads and writes, so they come from Asterisk's own alembic migrations (`contrib/ast-db-manage`). Those are generated **in advance** (alembic's offline mode, no database involved) and kept in `scripts/pjsip-schema/`, one file per Asterisk version: `ps-schema-16.7.0.sql`, `16.30.1`, `18.26.4`, `20.21.0`, `22.11.0`. The setup script picks the file for your version (exact match, else the newest of your major, which is a superset of older releases), downloads it, checks it against the SHA-256 pinned inside the script, and refuses anything that is not table creation before loading it as the database root. The PBX needs no python and no copy of Asterisk's source.
 
-```bash
-curl -fsSLO https://downloads.asterisk.org/pub/telephony/asterisk/releases/asterisk-16.7.0.tar.gz
-tar xzf asterisk-16.7.0.tar.gz asterisk-16.7.0/contrib/ast-db-manage && cd asterisk-16.7.0/contrib/ast-db-manage
-python3 -m venv v && v/bin/pip install 'alembic<1.8' 'sqlalchemy<1.5' pymysql
-cp config.ini.sample config.ini && sed -i 's#^sqlalchemy.url.*#sqlalchemy.url = mysql+pymysql://x:x@localhost/x#' config.ini
-v/bin/alembic -c config.ini upgrade head --sql > ps-schema.sql      # offline mode: no database is contacted
-```
-
-Copy `ps-schema.sql` to the PBX and add `--schema-sql ps-schema.sql` to the command. The tables are created in the script's own database (`irnoti_pjsip` by default).
+- A version without a file (for example another major) falls back to running the migrations on the PBX (needs `python3`; the script prepares the tools **before** it changes any file).
+- Add a version: `scripts/gen-pjsip-schema.sh 22.12.0` (needs git and python 3.8-3.11), then put the printed sha256 in `schema_hash()` and the version in `schema_latest()` of the setup script. `go test ./...` fails if a pin and its file disagree.
+- Your own SQL (generated elsewhere, or edited): `--schema-sql FILE`. Mirror the files: set `IRNOTI_SCHEMA_BASE` to your URL.
 
 ### TLS ended by a CDN (`--behind-proxy`)
 

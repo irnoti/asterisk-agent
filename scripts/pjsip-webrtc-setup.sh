@@ -17,11 +17,12 @@ set -euo pipefail
 ASTERISK_DIR="${ASTERISK_DIR:-/etc/asterisk}"
 STATE_DIR="${STATE_DIR:-/var/lib/irnoti-asterisk}"
 ODBC_INI="${ODBC_INI:-/etc/odbc.ini}"
+SCHEMA_BASE="${IRNOTI_SCHEMA_BASE:-https://raw.githubusercontent.com/irnoti/asterisk-agent/main/scripts/pjsip-schema}"
 TAG="irnoti-pjsip"
 DSN="irnoti-pjsip"
 
 CERT="" KEY="" TLS_PORT=8089 DB_NAME="irnoti_pjsip" DB_USER="irnoti_pjsip" DB_PASS="" MYSQL_ROOT_PASS=""
-SCHEMA_SQL="" BIND_LOCAL=0 BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
+SCHEMA_SQL="" SCHEMA_PLAN="" PREBUILT=1 BIND_LOCAL=0 BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
 MANUAL=()
 
 usage() {
@@ -45,8 +46,9 @@ Usage: pjsip-webrtc-setup.sh (--cert FILE --key FILE | --behind-proxy) [options]
   --db-pass PASS             Password for that user (letters, digits, _ . - only; generated when omitted).
   --mysql-root-pass PASS     MySQL root password (read from /etc/issabel.conf when present, else a socket login is tried).
   --skip-db                  Do not create the database or tables (they already exist); only wire ODBC and the config files.
-  --schema-sql FILE          Create the ps_* tables from this SQL file instead of running Asterisk's migrations here (no python3 needed
-                             on the PBX). Generate it on any machine with python: see "Schema without python on the PBX" in the README.
+  --schema-sql FILE          Create the ps_* tables from this SQL file. By default the script downloads the prebuilt, checksum-pinned
+                             file for this Asterisk version (scripts/pjsip-schema/), so neither python3 nor Asterisk's source is needed.
+  --no-prebuilt-schema       Do not use the prebuilt file; run Asterisk's own alembic migrations on this PBX (needs python3 + pip).
   --ast-source DIR           Use this Asterisk source tree for contrib/ast-db-manage instead of downloading it.
   --stun HOST:PORT           STUN server for ICE in rtp.conf (optional).
   --restart                  Restart Asterisk at the end (needed for noload and sorcery changes to take effect).
@@ -125,10 +127,7 @@ check_deps() {
   [ -n "$(odbcinst -q -d 2>/dev/null | grep -iE 'mysql|mariadb')" ] || need "no MySQL/MariaDB ODBC driver registered (odbcinst -q -d): install mysql-connector-odbc / odbc-mariadb$hint"
   [ "$SKIP_DB" = 1 ] && return 0
   command -v mysql >/dev/null || need "mysql client not found (install it, or use --skip-db)$hint"
-  if [ -n "$SCHEMA_SQL" ]; then
-    [ -r "$SCHEMA_SQL" ] || need "--schema-sql $SCHEMA_SQL is not a readable file"
-    return 0
-  fi
+  if [ -n "$SCHEMA_SQL" ] || [ -n "$SCHEMA_PLAN" ]; then return 0; fi # tables come from a SQL file: no python needed
   command -v python3 >/dev/null && python3 -c 'import venv, ensurepip' 2>/dev/null || need "python3 with venv/pip is required for Asterisk's database migrations: yum install python3 python3-pip  /  apt install python3-venv python3-pip$hint"
 }
 
@@ -140,7 +139,9 @@ preflight() {
   [ "${major:-0}" -ge 16 ] || die "Asterisk 16 or newer is required (found: $(asterisk -V))"
   [ "$(module_state res_pjsip)" = "Running" ] || die "res_pjsip is not running on this Asterisk"
   [ "$CHECK_ONLY" = 1 ] && return 0
+  resolve_schema
   check_deps
+  prepare_migrations
   if [ "$BEHIND_PROXY" = 1 ]; then return 0; fi
   [ -r "$CERT" ] && [ -r "$KEY" ] || die "give --cert and --key (Asterisk ends TLS), or --behind-proxy (a CDN/proxy ends TLS)"
   openssl x509 -in "$CERT" -noout >/dev/null 2>&1 || die "$CERT is not a certificate in PEM format"
@@ -148,6 +149,65 @@ preflight() {
   local a b
   a="$(openssl x509 -in "$CERT" -noout -pubkey | openssl sha256)"; b="$(openssl pkey -in "$KEY" -pubout 2>/dev/null | openssl sha256)"
   [ "$a" = "$b" ] || die "the key does not belong to the certificate"
+}
+
+# ───────── prebuilt table schema ─────────
+# sha256 of the files in scripts/pjsip-schema (a test keeps this list and the files in sync); a downloaded file must match.
+schema_hash() {
+  case "$1" in
+    ps-schema-16.30.1.sql) echo 54f146e38441e92409863fd5627b1896a9b30cbb95e891f7430faffeb5424d5a;;
+    ps-schema-16.7.0.sql) echo a50c449ca0a589df9a87b7a85d3c734292cf4b5f81d58e43fcd418574609c8af;;
+    ps-schema-18.26.4.sql) echo c6a4ddcb9650fab42a4b1da8e3076cc4c20985db2fa851462983f80dafa4b511;;
+    ps-schema-20.21.0.sql) echo f6461451a3fa06a0f81a839ac02863160dc87260ff773e4419251ddae319755f;;
+    ps-schema-22.11.0.sql) echo 48b2279c5031dbfc15c5c9fafa993d510f65cfae9ff38fb7ff6d6de34eb236a8;;
+  esac
+}
+# The newest shipped schema of each Asterisk major: a superset of every older release of that major (extra NULL columns are harmless).
+schema_latest() { case "$1" in 16) echo 16.30.1;; 18) echo 18.26.4;; 20) echo 20.21.0;; 22) echo 22.11.0;; esac; }
+version_gt() { [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -1)" = "$1" ]; }
+
+# The SQL runs as the database root, so it may only create tables and record the migration version.
+schema_safe() {
+  awk '
+    /^[[:space:]]*$/ { next }
+    /^--/ { next }
+    /^[[:space:]]/ { next }
+    /^\)/ { next }
+    /^(CREATE TABLE|ALTER TABLE|CREATE INDEX|CREATE UNIQUE INDEX) / { next }
+    /^(UPDATE|INSERT INTO) alembic_version / { next }
+    { print "unexpected statement: " $0 > "/dev/stderr"; bad = 1 }
+    END { exit bad }' "$1"
+}
+
+fetch() { if command -v curl >/dev/null; then curl -fsSL --max-time 90 -o "$2" "$1"; else wget -q -T 90 -O "$2" "$1"; fi; }
+
+# Sets SCHEMA_SQL to a verified file (or SCHEMA_PLAN in a dry run). Leaves both empty to fall back to Asterisk's migrations.
+resolve_schema() {
+  [ "$SKIP_DB" = 1 ] && return 0
+  if [ -n "$SCHEMA_SQL" ]; then
+    [ -r "$SCHEMA_SQL" ] || need "--schema-sql $SCHEMA_SQL is not a readable file"
+    schema_safe "$SCHEMA_SQL" || need "$SCHEMA_SQL contains statements other than table creation; refusing to run it as the database root"
+    return 0
+  fi
+  [ "$PREBUILT" = 1 ] || return 0
+  local ver major name latest dest
+  ver="$(asterisk -V | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"; major="${ver%%.*}"
+  name="ps-schema-$ver.sql"
+  if [ -z "$(schema_hash "$name")" ]; then
+    latest="$(schema_latest "$major")"
+    if [ -z "$latest" ]; then warn "no prebuilt table schema for Asterisk $ver; Asterisk's migrations will be used (needs python3)"; return 0; fi
+    name="ps-schema-$latest.sql"
+    version_gt "$ver" "$latest" && warn "Asterisk $ver is newer than the newest prebuilt schema ($latest); a column added since then may be missing (re-run with --no-prebuilt-schema to use the migrations)"
+  fi
+  say "table schema: prebuilt $name"
+  if [ "$DRY" = 1 ]; then SCHEMA_PLAN="$name"; return 0; fi
+  mkdir -p "$STATE_DIR/pjsip-schema"; dest="$STATE_DIR/pjsip-schema/$name"
+  if fetch "$SCHEMA_BASE/$name" "$dest" && [ "$(sha256sum "$dest" | cut -d' ' -f1)" = "$(schema_hash "$name")" ] && schema_safe "$dest"; then
+    SCHEMA_SQL="$dest"
+  else
+    rm -f "$dest"
+    warn "could not get a verified $name from $SCHEMA_BASE; falling back to Asterisk's migrations (needs python3)"
+  fi
 }
 
 # ───────── steps ─────────
@@ -288,7 +348,7 @@ step_db() {
   [ "$SKIP_DB" = 1 ] && { say "database: skipped"; return 0; }
   say "database $DB_NAME (user $DB_USER)"
   if [ "$DRY" = 1 ]; then
-    if [ -n "$SCHEMA_SQL" ]; then echo "    + create database/user, then load $SCHEMA_SQL (ps_* tables)"; else echo "    + create database/user, then run the Asterisk alembic migrations (ps_* tables)"; fi
+    if [ -n "$SCHEMA_SQL" ]; then echo "    + create database/user, then load $SCHEMA_SQL (ps_* tables)"; elif [ -n "$SCHEMA_PLAN" ]; then echo "    + create database/user, then download, verify and load the prebuilt $SCHEMA_PLAN"; else echo "    + create database/user, then run the Asterisk alembic migrations (ps_* tables)"; fi
     return 0
   fi
   command -v mysql >/dev/null || die "mysql client not found (install it or use --skip-db)"
@@ -307,27 +367,34 @@ step_db() {
   fi
 }
 
+# Fallback when no prebuilt schema is used: Asterisk's own migrations, prepared BEFORE any file is changed (source, venv, packages)
+# so a missing network or package stops the run early instead of half-way.
+prepare_migrations() {
+  [ "$SKIP_DB" = 1 ] || [ -n "$SCHEMA_SQL" ] || [ -n "$SCHEMA_PLAN" ] || [ "$DRY" = 1 ] || {
+    local work="$STATE_DIR/pjsip-schema" ver
+    mkdir -p "$work"
+    if [ -z "$AST_SOURCE" ]; then
+      ver="$(asterisk -V | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
+      say "downloading Asterisk $ver migrations"
+      fetch "https://downloads.asterisk.org/pub/telephony/asterisk/releases/asterisk-$ver.tar.gz" "$work/src.tgz" \
+        || fetch "https://downloads.asterisk.org/pub/telephony/asterisk/asterisk-${ver%%.*}-current.tar.gz" "$work/src.tgz" \
+        || die "download failed; use --schema-sql with a file made elsewhere, or pass the Asterisk source with --ast-source DIR"
+      tar -xzf "$work/src.tgz" -C "$work" --wildcards '*/contrib/ast-db-manage' || die "cannot unpack the Asterisk source"
+      AST_SOURCE="$(echo "$work"/asterisk-*)"
+      rm -f "$work/src.tgz"
+    fi
+    [ -d "$AST_SOURCE/contrib/ast-db-manage" ] || die "$AST_SOURCE/contrib/ast-db-manage not found"
+    python3 -m venv "$work/venv" && "$work/venv/bin/pip" -q install 'alembic<1.8' 'sqlalchemy<1.5' pymysql || die "cannot prepare the migration tools (python venv / pip install)"
+  }
+}
+
 migrate() {
-  # Asterisk's own migrations are the only schema that is guaranteed to match what it reads and writes
-  local work="$STATE_DIR/pjsip-schema" src="$AST_SOURCE" ver
-  mkdir -p "$work"
-  if [ -z "$src" ]; then
-    ver="$(asterisk -V | grep -oE '[0-9]+(\.[0-9]+)+' | head -1)"
-    say "downloading Asterisk $ver migrations"
-    curl -fsSL "https://downloads.asterisk.org/pub/telephony/asterisk/releases/asterisk-$ver.tar.gz" -o "$work/src.tgz" \
-      || curl -fsSL "https://downloads.asterisk.org/pub/telephony/asterisk/asterisk-${ver%%.*}-current.tar.gz" -o "$work/src.tgz" \
-      || die "download failed; fetch the Asterisk source yourself and pass --ast-source DIR"
-    tar -xzf "$work/src.tgz" -C "$work" --wildcards '*/contrib/ast-db-manage'
-    src="$(echo "$work"/asterisk-*)"
-  fi
-  [ -d "$src/contrib/ast-db-manage" ] || die "$src/contrib/ast-db-manage not found"
-  python3 -m venv "$work/venv"
-  "$work/venv/bin/pip" -q install 'alembic<1.8' 'sqlalchemy<1.5' pymysql
-  cp "$src/contrib/ast-db-manage/config.ini.sample" "$work/config.ini"
+  local work="$STATE_DIR/pjsip-schema"
+  cp "$AST_SOURCE/contrib/ast-db-manage/config.ini.sample" "$work/config.ini"
   sed -i "s#^sqlalchemy.url.*#sqlalchemy.url = mysql+pymysql://$DB_USER:$DB_PASS@localhost/$DB_NAME#" "$work/config.ini"
   chmod 600 "$work/config.ini"
-  ( cd "$src/contrib/ast-db-manage" && "$work/venv/bin/alembic" -c "$work/config.ini" upgrade head ) || die "alembic failed"
-  rm -f "$work/config.ini" "$work/src.tgz"
+  ( cd "$AST_SOURCE/contrib/ast-db-manage" && "$work/venv/bin/alembic" -c "$work/config.ini" upgrade head ) || { rm -f "$work/config.ini"; die "alembic failed"; }
+  rm -f "$work/config.ini"
 }
 
 step_odbc() {
@@ -404,7 +471,7 @@ main() {
       --cert) CERT="$2"; shift 2;; --key) KEY="$2"; shift 2;; --tls-port) TLS_PORT="$2"; shift 2;;
       --behind-proxy) BEHIND_PROXY=1; shift;; --bind-http-local) BIND_LOCAL=1; shift;; --proxy-port) PROXY_PORT="$2"; shift 2;;
       --db-name) DB_NAME="$2"; shift 2;; --db-user) DB_USER="$2"; shift 2;; --db-pass) DB_PASS="$2"; shift 2;;
-      --mysql-root-pass) MYSQL_ROOT_PASS="$2"; shift 2;; --ast-source) AST_SOURCE="$2"; shift 2;; --schema-sql) SCHEMA_SQL="$2"; shift 2;; --stun) STUN="$2"; shift 2;;
+      --mysql-root-pass) MYSQL_ROOT_PASS="$2"; shift 2;; --ast-source) AST_SOURCE="$2"; shift 2;; --schema-sql) SCHEMA_SQL="$2"; shift 2;; --no-prebuilt-schema) PREBUILT=0; shift;; --stun) STUN="$2"; shift 2;;
       --disable-chan-sip) DISABLE_CHAN_SIP=1; shift;; --restart) RESTART=1; shift;; --skip-db) SKIP_DB=1; shift;;
       --check) CHECK_ONLY=1; shift;; --dry-run) DRY=1; shift;; -h|--help) usage; exit 0;;
       *) usage; die "unknown option $1";;
