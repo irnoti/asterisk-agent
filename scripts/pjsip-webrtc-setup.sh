@@ -405,11 +405,19 @@ step_odbc() {
     [ "$DRY" = 1 ] && { warn "no MySQL/MariaDB ODBC driver registered (a real run stops here)"; driver="MariaDB"; } \
       || die "no MySQL/MariaDB ODBC driver registered (yum install mysql-connector-odbc  /  apt install odbc-mariadb)"
   fi
+  # MySQL's own ODBC driver (Connector/ODBC 5.x) ships its own client library whose default socket is /tmp/mysql.sock, so
+  # without an explicit Socket= a "localhost" connection fails on distributions that keep the socket elsewhere.
+  local sock=""
+  if [ "$DRY" = 0 ] && command -v mysql >/dev/null; then
+    sock="$(mysql_root <<<"SELECT @@socket;" 2>/dev/null | tail -1 || true)"
+    case "$sock" in /*) ;; *) sock="";; esac
+  fi
   set_block "$ODBC_INI" odbc "$DSN" "Description=IRNoti PJSIP realtime
 Driver=$driver
 Server=localhost
 Port=3306
-Database=$DB_NAME"
+Database=$DB_NAME${sock:+
+Socket=$sock}"
   set_block "$ASTERISK_DIR/res_odbc.conf" odbc "$DSN" "enabled => yes
 dsn => $DSN
 username => $DB_USER
@@ -447,6 +455,8 @@ step_finish() {
     else service asterisk restart; fi
     sleep 8
     diagnose
+    ast "odbc show" | grep -A4 "$DSN" | grep -Eq 'active connections: [1-9]' \
+      || { warn "the ODBC data source $DSN is not connected: check Socket= and Database= in $ODBC_INI, the user/password in res_odbc.conf and /var/log/asterisk/full"; MANUAL+=("ODBC data source $DSN is not connected"); }
   else
     say "Restart Asterisk (service asterisk restart), then check:"
     echo '    asterisk -rx "module show like pjsip_transport_websocket"   # Running'
