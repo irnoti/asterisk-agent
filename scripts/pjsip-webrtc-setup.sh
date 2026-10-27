@@ -152,7 +152,13 @@ step_proxy() {
     warn "Asterisk's HTTP server listens on $bound, so ARI (/ari) is reachable from the network. Bind it to 127.0.0.1 (http.conf: bindaddr=127.0.0.1) and let the proxy forward only /ws."
     MANUAL+=("http.conf: bindaddr=$bound exposes ARI; bind to 127.0.0.1")
   else
-    say "Asterisk HTTP is on 127.0.0.1 (good): ARI stays private"
+    say "Asterisk HTTP is on 127.0.0.1 (good)"
+  fi
+  # the TLS listener serves the same /ari, so it must not face the network either
+  local tls; tls="$(ast "http show status" | sed -n 's/.*HTTPS Server Enabled and Bound to \([0-9.]*\):\([0-9]*\).*/\1:\2/p' | head -1)"
+  if [ -n "$tls" ] && [ "${tls%%:*}" != "127.0.0.1" ]; then
+    warn "Asterisk's HTTPS server is enabled on $tls and serves /ari too. With a proxy in front it is not needed: remove tlsenable/tlsbindaddr from http.conf (or an included http_*.conf), or bind it to 127.0.0.1."
+    MANUAL+=("http.conf: HTTPS listener on $tls exposes ARI; disable it or bind to 127.0.0.1")
   fi
   cat <<EOT
 
