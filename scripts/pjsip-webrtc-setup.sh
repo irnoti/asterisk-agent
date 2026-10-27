@@ -7,7 +7,7 @@
 #   2. a PJSIP transport (wss, or ws behind a proxy)   (pjsip_irnoti_ws[s].conf, included from pjsip_custom.conf / pjsip.conf)
 #   3. ICE for the audio path                       (rtp.conf)
 #   4. PJSIP objects stored in a database (realtime): MySQL/MariaDB + ODBC + the ps_* tables from Asterisk's own migrations
-#   5. chan_sip off (optional flag): on Asterisk 16 it blocks PJSIP's WebSocket transport
+#   5. chan_sip: websocket_enabled=no (it stays loaded; on Asterisk 16 it would otherwise block PJSIP's WebSocket transport)
 #
 # Safe by design: every change sits in a ";--- BEGIN irnoti-pjsip:<name> ---" block, each file is backed up to
 # /var/lib/irnoti-asterisk/pjsip-backup/<time>/ first, re-running replaces the blocks, and nothing is restarted without --restart.
@@ -40,8 +40,9 @@ Usage: pjsip-webrtc-setup.sh (--cert FILE --key FILE | --behind-proxy) [options]
                              Skip it if IP phones fetch provisioning files from this PBX's HTTP port.
   --proxy-port N             Port the proxy listens on for the CDN (default 8080; Cloudflare reaches origins over HTTP on
                              80, 8080, 8880, 2052, 2082, 2086, 2095).
-  --disable-chan-sip         Add "noload => chan_sip.so". Needed on Asterisk 16, where chan_sip blocks PJSIP's WebSocket
-                             transport. THIS STOPS EVERY chan_sip EXTENSION AND TRUNK: use it on a test PBX or after moving them to PJSIP.
+  --disable-chan-sip         Add "noload => chan_sip.so". Normally NOT needed: the script sets websocket_enabled=no for chan_sip, which
+                             frees PJSIP's WebSocket transport and keeps chan_sip extensions and trunks working. This flag stops
+                             every chan_sip extension AND TRUNK; use it only on a test PBX or after moving them to PJSIP.
   --db-name / --db-user      Database and user for the PJSIP tables (default irnoti_pjsip).
   --db-pass PASS             Password for that user (letters, digits, _ . - only; generated when omitted).
   --mysql-root-pass PASS     MySQL root password (read from /etc/issabel.conf when present, else a socket login is tried).
@@ -215,14 +216,27 @@ resolve_schema() {
 
 # ───────── steps ─────────
 step_chan_sip() {
-  [ "$(module_state chan_sip)" = "Running" ] || return 0
+  local mods="$ASTERISK_DIR/modules.conf" removed=0 tmp
   if [ "$DISABLE_CHAN_SIP" = 1 ]; then
+    [ "$(module_state chan_sip)" = "Running" ] || return 0
     say "chan_sip: adding noload (takes effect after a restart)"
-    set_block "$ASTERISK_DIR/modules.conf" nosip modules 'noload => chan_sip.so'
+    set_block "$mods" nosip modules 'noload => chan_sip.so'
+    return 0
+  fi
+  # an earlier run (or --disable-chan-sip) may have switched chan_sip off: its extensions and trunks need it back
+  if grep -q ";--- BEGIN $TAG:nosip " "$mods" 2>/dev/null; then
+    say "chan_sip: removing the noload block added earlier (your chan_sip trunks and extensions need it)"
+    backup "$mods"
+    if [ "$DRY" = 0 ]; then tmp="$(mktemp)"; strip_block "$mods" nosip >"$tmp"; cat "$tmp" >"$mods"; rm -f "$tmp"; fi
+    removed=1
+  fi
+  [ "$removed" = 1 ] || [ "$(module_state chan_sip)" = "Running" ] || return 0
+  # chan_sip claims the WebSocket protocol name "sip", which PJSIP's WebSocket transport needs: give it up, keep chan_sip itself
+  say "chan_sip: websocket_enabled=no (chan_sip keeps working; PJSIP gets the WebSocket protocol)"
+  if grep -Eq '^#include[[:space:]]+"?sip_general_custom\.conf' "$ASTERISK_DIR/sip.conf" 2>/dev/null; then
+    set_block "$ASTERISK_DIR/sip_general_custom.conf" nows "" 'websocket_enabled=no'
   else
-    warn "chan_sip is loaded. On Asterisk 16 it keeps res_pjsip_transport_websocket from loading, so the browser phone cannot connect."
-    warn "Re-run with --disable-chan-sip (test PBX), or move your extensions to PJSIP first. See the guide, section 3."
-    MANUAL+=("chan_sip is still loaded: the WebSocket transport will not start until it is disabled")
+    set_block "$ASTERISK_DIR/sip.conf" nows general 'websocket_enabled=no'
   fi
 }
 

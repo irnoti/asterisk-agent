@@ -120,7 +120,7 @@ Skip this whole section if you do not use the browser phone: calls, IVR, campaig
   - **A CDN or reverse proxy ends TLS** (`--behind-proxy`): no certificate on the PBX. The browser connects to `wss://your-domain/ws`, the CDN opens it and passes a plain WebSocket to the PBX (see below).
 - MySQL/MariaDB on the PBX (or reachable from it) and a MySQL/MariaDB **ODBC driver** registered (`odbcinst -q -d`).
 - Nothing else to install for the tables: the script downloads a **prebuilt, checksum-pinned** SQL file for your Asterisk version from this repository (`scripts/pjsip-schema/`, raw.githubusercontent.com). Only if none exists for your version does it fall back to Asterisk's own migrations, which need `python3` with `venv`/`pip` and access to `downloads.asterisk.org`.
-- On **Asterisk 16, `chan_sip` must not be loaded.** `chan_sip` claims the WebSocket protocol name `sip`, so PJSIP's WebSocket transport (`res_pjsip_transport_websocket`) refuses to start while it is loaded. The signature in `/var/log/asterisk/full` is `Registered SIP service WebSocket Transport Module` immediately followed by `Unregistered SIP service WebSocket Transport Module`. Disabling `chan_sip` stops every extension and trunk that uses it (typical on Issabel/Elastix), so do it on a test PBX, after moving them to PJSIP, or use a separate Asterisk for IRNoti. Asterisk 20+ no longer ships `chan_sip`.
+- On **Asterisk 16, `chan_sip` claims the WebSocket protocol name `sip`**, so PJSIP's WebSocket transport (`res_pjsip_transport_websocket`) refuses to start while `chan_sip` has it. The signature in `/var/log/asterisk/full` is `Registered SIP service WebSocket Transport Module` immediately followed by `Unregistered SIP service WebSocket Transport Module`. You do **not** need to unload `chan_sip`: the script sets `websocket_enabled=no` for it (in `sip_general_custom.conf`, or under `[general]` in `sip.conf`), so your `chan_sip` extensions and trunks (typical on Issabel/Elastix) keep working and PJSIP gets the protocol. `--disable-chan-sip` (`noload => chan_sip.so`) is a last resort that stops every `chan_sip` extension and trunk. Asterisk 20+ no longer ships `chan_sip`.
 
 ### Run it
 
@@ -129,8 +129,8 @@ Always look first. `--check` and `--dry-run` change nothing:
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/irnoti/asterisk-agent/main/scripts/pjsip-webrtc-setup.sh
 sudo bash pjsip-webrtc-setup.sh --check
-sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem --disable-chan-sip --dry-run
-sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem --disable-chan-sip --restart
+sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem --dry-run
+sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem --restart
 ```
 
 | Option | Meaning |
@@ -139,7 +139,7 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 | `--tls-port N` | With `--cert`: HTTPS/WSS port (default `8089`). |
 | `--behind-proxy` | TLS ends at a CDN/proxy. No certificate needed; excludes `--cert/--key`. Configures a plain `transport-ws`, checks that Asterisk's HTTP server is on `127.0.0.1` (ARI must stay private) and prints the proxy snippet. |
 | `--proxy-port N` | With `--behind-proxy`: port the proxy listens on for the CDN (default `8080`). |
-| `--disable-chan-sip` | Adds `noload => chan_sip.so` (see above). |
+| `--disable-chan-sip` | Adds `noload => chan_sip.so`. Not needed normally (see above); it stops every `chan_sip` extension and trunk. |
 | `--db-name`, `--db-user`, `--db-pass` | Database and user for the PJSIP tables (default `irnoti_pjsip`; the password is generated when omitted). Only letters, digits, `_`, `.`, `-`. |
 | `--mysql-root-pass` | MySQL root password. Otherwise it is read from `/etc/issabel.conf` if present, then a plain `root` login is tried. |
 | `--skip-db` | Do not create the database or tables (they exist); only wire ODBC and the config files. |
@@ -156,7 +156,7 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 
 | Step | Where | Change |
 |---|---|---|
-| 1. `chan_sip` | `modules.conf` | With `--disable-chan-sip`: `noload => chan_sip.so`. Without it, a warning if `chan_sip` is running. |
+| 1. `chan_sip` | `sip_general_custom.conf` (or `sip.conf`) | `websocket_enabled=no`, so `chan_sip` stays loaded but leaves the `sip` WebSocket protocol to PJSIP. Removes the `noload` block an earlier run or `--disable-chan-sip` added. |
 | 2. HTTPS *(with `--behind-proxy`: proxy check instead)* | `http.conf`, `keys/irnoti/` | `tlsenable`, `tlsbindaddr=0.0.0.0:<port>`, certificate and key (copied to `/etc/asterisk/keys/irnoti/`, key readable by Asterisk only). An existing `tlsenable` is left alone and reported. |
 | 3. Transport | `pjsip_irnoti_wss.conf` (`..._ws.conf` behind a proxy), included from `pjsip_custom.conf` (or `pjsip.conf`) | `[transport-wss]` with `protocol=wss` (`[transport-ws]` with `protocol=ws` behind a proxy). |
 | 4. ICE | `rtp.conf` | `icesupport=yes` (+ `stunaddr`). |
@@ -196,7 +196,7 @@ browser <==== audio: DTLS-SRTP over UDP, straight to the PBX's public IP (never 
 
 ### Undo
 
-Delete the `irnoti-pjsip` blocks (or restore the files from the backup directory), remove the `noload` block to bring `chan_sip` back, and restart Asterisk. The database is separate and can be dropped (`DROP DATABASE irnoti_pjsip`).
+Delete the `irnoti-pjsip` blocks (or restore the files from the backup directory), remove the `websocket_enabled=no` block (and any `noload` block), and restart Asterisk. The database is separate and can be dropped (`DROP DATABASE irnoti_pjsip`).
 
 ### After it ran
 
