@@ -106,6 +106,16 @@ The agent is installed on a machine the customer controls, so its code is visibl
 - **Every change is reversible:** backups before each write, automatic rollback on failure, and a manual `rollback`.
 - **Hardened service:** the unit uses `NoNewPrivileges`, `ProtectSystem=full`, `ProtectHome` and `PrivateTmp`, and may write only to `/etc/asterisk`, `/etc/irnoti-asterisk` and `/var/lib/irnoti-asterisk`. It runs as root only because it edits Asterisk's configuration and reloads it.
 
+## Browser phone (PJSIP over WSS)
+
+The platform's in-page phone registers a PJSIP account from the browser over WSS. That needs PJSIP realtime, a WSS transport and an HTTPS listener, which the agent does not configure. `scripts/pjsip-webrtc-setup.sh` does it in marked, backed-up blocks (run it with `--check` or `--dry-run` first):
+
+```bash
+sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem --disable-chan-sip --dry-run
+```
+
+On Asterisk 16, `chan_sip` keeps PJSIP's WebSocket transport from loading, so `--disable-chan-sip` is required there and stops every `chan_sip` extension and trunk. The full guide (diagnosis, certificates behind a CDN, manual steps, troubleshooting) is `docs/VOIP-PJSIP-WEBRTC.md` in the platform repository.
+
 ## Troubleshooting
 
 | Symptom | What to check |
