@@ -141,10 +141,13 @@ step_chan_sip() {
 step_proxy() {
   say "WebSocket entry point behind a TLS-ending proxy"
   # Asterisk serves /ari and /ws from the same HTTP server, so it must not be opened to the network: only /ws may pass
-  local bound; bound="$(ast "http show status" | sed -n 's/.*Bound to \([0-9.]*\):.*/\1/p' | head -1)"
+  local bound hport status
+  status="$(ast "http show status" | grep 'Bound to' | head -1)"
+  bound="$(printf '%s' "$status" | sed -n 's/.*Bound to \([0-9.]*\):.*/\1/p')"
+  hport="$(printf '%s' "$status" | sed -n 's/.*Bound to [0-9.]*:\([0-9]*\).*/\1/p')"; hport="${hport:-8088}"
   if [ -z "$bound" ]; then
     warn "Asterisk's HTTP server is not running (http show status). Enable it in http.conf (enabled=yes, bindaddr=127.0.0.1)."
-    MANUAL+=("http.conf: enable Asterisk's HTTP server on 127.0.0.1:8088")
+    MANUAL+=("http.conf: enable Asterisk's HTTP server on 127.0.0.1:$hport")
   elif [ "$bound" != "127.0.0.1" ]; then
     warn "Asterisk's HTTP server listens on $bound, so ARI (/ari) is reachable from the network. Bind it to 127.0.0.1 (http.conf: bindaddr=127.0.0.1) and let the proxy forward only /ws."
     MANUAL+=("http.conf: bindaddr=$bound exposes ARI; bind to 127.0.0.1")
@@ -158,7 +161,7 @@ step_proxy() {
       server {
         listen $PROXY_PORT;
         location = /ws {
-          proxy_pass http://127.0.0.1:8088/ws;
+          proxy_pass http://127.0.0.1:$hport/ws;
           proxy_http_version 1.1;
           proxy_set_header Upgrade \$http_upgrade;
           proxy_set_header Connection "upgrade";
