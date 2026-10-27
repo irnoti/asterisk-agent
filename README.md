@@ -108,6 +108,8 @@ The agent is installed on a machine the customer controls, so its code is visibl
 
 ## Browser phone (PJSIP over WSS)
 
+The script needs **no options** on a typical PBX: without `--cert` it assumes a CDN/proxy ends TLS, binds Asterisk's HTTP to `127.0.0.1`, writes the Apache `/ws` proxy, finds the public IP when the PBX is behind NAT, keeps `chan_sip` working, tests and repairs how Asterisk reads whole numbers from the database (MySQL Connector/ODBC 5.3 returns `0` for integers on some builds, which makes Asterisk refuse the endpoint), opens the RTP range in the PBX's own firewall and restarts Asterisk. At the end it prints the one thing it cannot do from the PBX: the UDP forward on your router.
+
 The platform's in-page phone (`/panel/voip/softphone`) lets a customer call and answer from the browser. The browser registers a PJSIP account over **WSS** (SIP over a secure WebSocket) with JsSIP, and the platform creates those accounts through ARI. The agent itself does not set any of this up, so the PBX needs a few extra things: an HTTPS listener for the WebSocket, a `transport-wss`, PJSIP configuration stored in a database (*realtime*), and ICE for the audio path. `scripts/pjsip-webrtc-setup.sh` does all of it in one go.
 
 Skip this whole section if you do not use the browser phone: calls, IVR, campaigns and prompts work without it.
@@ -129,8 +131,10 @@ Always look first. `--check` and `--dry-run` change nothing:
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/irnoti/asterisk-agent/main/scripts/pjsip-webrtc-setup.sh
 sudo bash pjsip-webrtc-setup.sh --check
-sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem --dry-run
-sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem --restart
+sudo bash pjsip-webrtc-setup.sh --dry-run     # show everything it would do
+sudo bash pjsip-webrtc-setup.sh               # do it (no options needed)
+# only when Asterisk itself ends TLS:
+sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem
 ```
 
 | Option | Meaning |
@@ -148,7 +152,9 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 | `--ast-source DIR` | With the migrations: use this Asterisk source tree for `contrib/ast-db-manage` instead of downloading it. |
 | `--public-ip IP`, `--local-ip IP` | The PBX is behind a one-to-one NAT (port forwards): ICE then offers this public address instead of the private one (`[ice_host_candidates]` in `rtp.conf`). `--local-ip` defaults to the address of the default route. Use it instead of `--stun`. |
 | `--stun HOST:PORT` | STUN server for ICE (`rtp.conf`). |
-| `--restart` | Restart Asterisk at the end. `noload` and the realtime mapping only take effect after a restart (a reload is not enough). |
+| `--no-restart` | Do not restart Asterisk at the end. The default is to restart (the realtime mapping and `websocket_enabled` only take effect after a restart; a reload is not enough); calls in progress are dropped. |
+| `--no-proxy-setup` | With `--behind-proxy`, do not write the Apache `/ws` proxy (`/etc/httpd/conf.d/irnoti-ws.conf`); the snippets are printed instead. |
+| `--no-firewall` | Do not open the RTP range (UDP) in this PBX's own firewall (firewalld, ufw, iptables). |
 | `--check` | Report the state (Asterisk version, module states, transports, ODBC); change nothing. |
 | `--dry-run` | Print every step; change nothing. |
 

@@ -22,12 +22,16 @@ TAG="irnoti-pjsip"
 DSN="irnoti-pjsip"
 
 CERT="" KEY="" TLS_PORT=8089 DB_NAME="irnoti_pjsip" DB_USER="irnoti_pjsip" DB_PASS="" MYSQL_ROOT_PASS=""
-PUBLIC_IP="" LOCAL_IP="" SCHEMA_SQL="" SCHEMA_PLAN="" PREBUILT=1 BIND_LOCAL=0 BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
+PUBLIC_IP="" LOCAL_IP="" SCHEMA_SQL="" SCHEMA_PLAN="" PREBUILT=1 BIND_LOCAL=0 BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=1 WEB_PROXY=1 FIREWALL=1 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
 MANUAL=()
 
 usage() {
   cat <<'EOF'
-Usage: pjsip-webrtc-setup.sh (--cert FILE --key FILE | --behind-proxy) [options]
+Usage: pjsip-webrtc-setup.sh [options]          (no options needed: it works out the rest and does it)
+
+  With no --cert it assumes a CDN / reverse proxy ends TLS (--behind-proxy), binds Asterisk's HTTP to 127.0.0.1, writes the Apache /ws
+  proxy, finds the public IP when the PBX is behind NAT, fixes what the PBX's database driver needs, opens the RTP range in the PBX's own
+  firewall and restarts Asterisk. Run with --dry-run first to see it, --check to only look.
 
   TLS is ended in one of two places; pick one:
   --cert FILE / --key FILE   Asterisk ends TLS itself: certificate (full chain) and private key the browser trusts for your domain.
@@ -55,7 +59,10 @@ Usage: pjsip-webrtc-setup.sh (--cert FILE --key FILE | --behind-proxy) [options]
                              the private address ([ice_host_candidates] in rtp.conf). Use it instead of --stun. --local-ip IP names the
                              private address (default: the one used for the default route).
   --stun HOST:PORT           STUN server for ICE in rtp.conf (optional).
-  --restart                  Restart Asterisk at the end (needed for noload and sorcery changes to take effect).
+  --no-restart               Do not restart Asterisk at the end (the default is to restart: the sorcery/realtime mapping needs it).
+                             Calls in progress are dropped.
+  --no-proxy-setup           Do not write the Apache /ws proxy for --behind-proxy (the snippets are printed instead).
+  --no-firewall              Do not open the RTP range in this PBX's own firewall (firewalld / ufw / iptables).
   --check                    Only report the state of this server; change nothing.
   --dry-run                  Show what would change; change nothing.
 EOF
@@ -73,6 +80,33 @@ http_target() { # the file our HTTP settings go to: http_custom.conf when http.c
   if grep -Eq '^#include[[:space:]]+"?http_custom\.conf' "$ASTERISK_DIR/http.conf" 2>/dev/null; then echo "$ASTERISK_DIR/http_custom.conf"; else echo "$ASTERISK_DIR/http.conf"; fi
 }
 module_state() { local l; l="$(ast "module show like $1" | grep -F "$1.so" | head -1)"; case "$l" in "") echo "not available";; *"Not Running"*) echo "Not Running";; *) echo "Running";; esac; }
+
+local_ip() { [ -n "$LOCAL_IP" ] && { echo "$LOCAL_IP"; return; }; ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1; }
+is_private() { [[ "$1" =~ ^(10\.|192\.168\.|172\.(1[6-9]|2[0-9]|3[01])\.|100\.(6[4-9]|[7-9][0-9]|1[01][0-9]|12[0-7])\.) ]]; }
+rtp_range() { # "start end" from rtp.conf (Asterisk's default is 10000-20000)
+  local f a b
+  for f in "$ASTERISK_DIR/rtp.conf" "$ASTERISK_DIR/rtp_custom.conf"; do
+    [ -e "$f" ] || continue
+    a="$(sed -n 's/^[[:space:]]*rtpstart[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$f" | tail -1)"; [ -z "$a" ] || RTP_A="$a"
+    b="$(sed -n 's/^[[:space:]]*rtpend[[:space:]]*=[[:space:]]*\([0-9]*\).*/\1/p' "$f" | tail -1)"; [ -z "$b" ] || RTP_B="$b"
+  done
+  echo "${RTP_A:-10000} ${RTP_B:-20000}"
+}
+detect_public_ip() { # only when behind NAT and nothing was given
+  [ -z "$PUBLIC_IP" ] && [ -z "$STUN" ] || return 0
+  local lip pub; lip="$(local_ip)"
+  [ -n "$lip" ] && is_private "$lip" || return 0
+  for u in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com; do
+    pub="$(curl -fsS -m 6 "$u" 2>/dev/null | tr -d '[:space:]' || true)"
+    [[ "$pub" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break || pub=""
+  done
+  if [ -n "$pub" ] && ! is_private "$pub"; then
+    PUBLIC_IP="$pub"; say "this PBX is behind NAT ($lip); its public address is $PUBLIC_IP (override with --public-ip)"
+  else
+    warn "this PBX is on a private address ($lip) and its public address could not be found: pass --public-ip, or the browser cannot reach the audio"
+    MANUAL+=("run again with --public-ip YOUR.PUBLIC.IP (browsers need it to send audio to this PBX)")
+  fi
+}
 
 # ───────── config-file blocks ─────────
 begin() { echo ";--- BEGIN $TAG:$1 (managed by pjsip-webrtc-setup.sh; delete the block to undo) ---"; }
@@ -262,6 +296,25 @@ step_proxy() {
     warn "Asterisk's HTTPS server is enabled on $tls and serves /ari too. With a proxy in front it is not needed: --bind-http-local switches it off (or remove tlsenable from http.conf / http_additional.conf / http_custom.conf)."
     MANUAL+=("http.conf: HTTPS listener on $tls exposes ARI; disable it or bind to 127.0.0.1")
   fi
+  if auto_proxy "$hport"; then
+    local lip; lip="$(local_ip)"
+    cat <<EOT
+
+    /ws is now answered on port $PROXY_PORT of this PBX. If a separate nginx (the CDN's origin) sits in front, point it here:
+
+      location = /ws {
+        proxy_pass http://${lip:-THIS-PBX}:$PROXY_PORT;
+        proxy_http_version 1.1;
+        proxy_set_header Upgrade \$http_upgrade;
+        proxy_set_header Connection "upgrade";
+        proxy_set_header Host \$host;
+        proxy_read_timeout 3600s;
+      }
+      location / { return 404; }
+
+EOT
+    return 0
+  fi
   cat <<EOT
 
     Put this in front of Asterisk (nginx; the CDN's origin is http://THIS-SERVER:$PROXY_PORT). It forwards ONLY /ws:
@@ -298,6 +351,104 @@ step_proxy() {
     it goes straight to this PBX's public IP, so open the RTP range (rtp.conf) to the internet.
 
 EOT
+}
+
+
+# Writes the Apache vhost that forwards only /ws to Asterisk. Returns 1 when it cannot (the snippets are then printed).
+auto_proxy() { # asterisk http port
+  [ "$WEB_PROXY" = 1 ] || return 1
+  local conf reload test="" owner
+  if command -v httpd >/dev/null && [ -d /etc/httpd/conf.d ]; then
+    conf=/etc/httpd/conf.d/irnoti-ws.conf; test="httpd -t"; reload="systemctl reload httpd || service httpd reload"
+    httpd -M 2>/dev/null | grep -q 'proxy_wstunnel_module' || { warn "Apache has no mod_proxy_wstunnel; cannot set up the /ws proxy here"; return 1; }
+  elif command -v apache2ctl >/dev/null && [ -d /etc/apache2/conf-available ]; then
+    conf=/etc/apache2/conf-available/irnoti-ws.conf; test="apache2ctl -t"; reload="systemctl reload apache2"
+    run a2enmod -q proxy proxy_wstunnel >/dev/null || return 1
+  else
+    return 1
+  fi
+  owner="$(ss -ltnp 2>/dev/null | awk -v p=":$PROXY_PORT" '$4 ~ p"$" {print $NF}' | head -1)"
+  case "$owner" in ""|*httpd*|*apache2*) ;; *) warn "port $PROXY_PORT is used by $owner; pick another with --proxy-port"; return 1;; esac
+  local body="Listen $PROXY_PORT
+<VirtualHost *:$PROXY_PORT>
+  ProxyRequests Off
+  <Location \"/\">
+    Require all denied
+  </Location>
+  <Location \"/ws\">
+    Require all granted
+    ProxyPass \"ws://127.0.0.1:$1/ws\"
+  </Location>
+</VirtualHost>"
+  say "Apache: forwarding only /ws on port $PROXY_PORT to Asterisk ($conf)"
+  backup "$conf"
+  if [ "$DRY" = 1 ]; then echo "    + write $conf, check it ($test) and reload Apache"; return 0; fi
+  printf '%s\n' "$body" >"$conf"
+  [ "$conf" != /etc/apache2/conf-available/irnoti-ws.conf ] || a2enconf -q irnoti-ws >/dev/null
+  if ! $test >/dev/null 2>&1; then
+    warn "Apache rejected the /ws proxy config; removed it again"
+    if [ -e "$BACKUP_DIR$conf" ]; then cp -p "$BACKUP_DIR$conf" "$conf"; else rm -f "$conf"; fi
+    return 1
+  fi
+  sh -c "$reload" >/dev/null 2>&1 || warn "could not reload Apache; reload it by hand to start the /ws proxy"
+}
+
+# Opens the RTP range (UDP) in the PBX's own firewall: without it the browser connects but no audio flows either way.
+step_firewall() {
+  [ "$FIREWALL" = 1 ] || return 0
+  local a b; read -r a b <<<"$(rtp_range)"
+  say "firewall: UDP $a-$b (audio) on this PBX"
+  if command -v firewall-cmd >/dev/null && systemctl is-active firewalld >/dev/null 2>&1; then
+    run firewall-cmd -q --permanent --add-port="$a-$b/udp" && run firewall-cmd -q --reload
+  elif command -v ufw >/dev/null && ufw status 2>/dev/null | grep -q '^Status: active'; then
+    run ufw allow "$a:$b/udp" >/dev/null
+  elif command -v iptables >/dev/null && iptables -S INPUT 2>/dev/null | grep -Eq '^-P INPUT (DROP|REJECT)|-j (DROP|REJECT)'; then
+    if iptables -C INPUT -p udp --dport "$a:$b" -j ACCEPT 2>/dev/null; then say "already open"; return 0; fi
+    run iptables -I INPUT 1 -p udp --dport "$a:$b" -m comment --comment irnoti-rtp -j ACCEPT
+    if [ "$DRY" = 0 ]; then
+      if command -v service >/dev/null && service iptables save >/dev/null 2>&1; then :; elif [ -d /etc/sysconfig ]; then iptables-save >/etc/sysconfig/iptables 2>/dev/null || true; fi
+      grep -qi issabel /etc/issabel.conf 2>/dev/null && MANUAL+=("Issabel's firewall module rebuilds iptables from its own list: also allow UDP $a-$b there (Security > Firewall) so the rule survives")
+    fi
+  else
+    say "no active firewall found on this PBX"
+  fi
+}
+
+# Whole numbers that Asterisk reads back as 0 (seen with MySQL Connector/ODBC 5.3 on Asterisk 16) make it refuse the endpoint
+# ("Session timer minimum expires time must be 90") and offer no audio stream ("Incompatible SDP"). Test it and repair it.
+canary_read() { ast "realtime load ps_endpoints id irnoti-canary" | awk '$1=="timers_min_se" {print $2}'; }
+heal_odbc_ints() {
+  [ "$DRY" = 0 ] && [ "$SKIP_DB" = 0 ] || return 0
+  say "checking that Asterisk reads whole numbers from the database"
+  local q="\`$DB_NAME\`.ps_endpoints"
+  mysql_root <<<"DELETE FROM $q WHERE id='irnoti-canary'; INSERT INTO $q (id, timers_min_se) VALUES ('irnoti-canary', 95);" 2>/dev/null \
+    || { warn "could not write the test row; skipped"; return 0; }
+  local got; got="$(canary_read)"
+  if [ "$got" != 95 ]; then
+    warn "Asterisk reads ${got:-nothing} where the database holds 95; trying the driver options"
+    write_dsn "$(printf '%s' "$ODBC_EXTRA" | grep -v '^option=')"; ast "module reload res_odbc.so" >/dev/null; sleep 3
+    got="$(canary_read)"
+  fi
+  if [ "$got" != 95 ]; then
+    warn "still ${got:-nothing}; storing the whole-number columns as text (Asterisk reads text correctly)"
+    local alter
+    alter="$(mysql_root <<<"SELECT CONCAT('ALTER TABLE \`', table_name, '\` MODIFY \`', column_name, '\` VARCHAR(20) NULL DEFAULT NULL;') FROM information_schema.columns WHERE table_schema='$DB_NAME' AND table_name IN ('ps_endpoints','ps_aors','ps_auths','ps_registrations','ps_endpoint_id_ips') AND data_type IN ('int','tinyint','smallint','mediumint','bigint');" | tail -n +2)"
+    { printf 'USE `%s`;\n' "$DB_NAME"; printf '%s\n' "$alter"; } | mysql_root 2>/dev/null || warn "converting the columns failed"
+    ast "module reload res_odbc.so" >/dev/null; sleep 3
+    got="$(canary_read)"
+  fi
+  mysql_root <<<"DELETE FROM $q WHERE id='irnoti-canary';" 2>/dev/null || true
+  if [ "$got" = 95 ]; then say "whole numbers are read correctly"
+  else warn "Asterisk still misreads whole numbers (got '${got:-nothing}'): see the guide, section 'numbers read as 0'"; MANUAL+=("ODBC: Asterisk reads whole numbers from ps_endpoints as 0 (check the driver, odbc.ini and res_odbc.conf)"); fi
+}
+
+# What the router in front of the PBX must do; this part cannot be done from the PBX.
+audio_summary() {
+  local a b lip; read -r a b <<<"$(rtp_range)"; lip="$(local_ip)"
+  [ -n "$PUBLIC_IP" ] || return 0
+  echo
+  say "Audio does not go through the CDN. On your router/firewall (MikroTik: IP > Firewall > NAT, chain dstnat), forward:"
+  echo "      UDP $a-$b   $PUBLIC_IP  ->  ${lip:-this PBX}   (protocol udp, NOT tcp)"
 }
 
 step_tls() {
@@ -358,8 +509,7 @@ stunaddr=$stun}"
   fi
   [ -n "$PUBLIC_IP" ] || return 0
   # behind NAT Asterisk would otherwise offer only its private address as the ICE host candidate, which an outside browser cannot reach
-  local lip="$LOCAL_IP"
-  [ -n "$lip" ] || lip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+  local lip; lip="$(local_ip)"
   if [ -z "$lip" ]; then
     warn "cannot tell the PBX's private address; pass --local-ip"; MANUAL+=("rtp.conf: add [ice_host_candidates] with  <private-ip> => $PUBLIC_IP")
     return 0
@@ -430,6 +580,15 @@ migrate() {
   rm -f "$work/config.ini"
 }
 
+write_dsn() { # extra lines (option/charset) for the DSN
+  set_block "$ODBC_INI" odbc "$DSN" "Description=IRNoti PJSIP realtime
+Driver=$ODBC_DRIVER
+Server=localhost
+Port=3306
+Database=$DB_NAME${ODBC_SOCK:+
+Socket=$ODBC_SOCK}$1"
+}
+
 step_odbc() {
   say "ODBC data source $DSN"
   local driver
@@ -453,12 +612,8 @@ charset=utf8";; esac
     sock="$(mysql_root <<<"SELECT @@socket;" 2>/dev/null | tail -1 || true)"
     case "$sock" in /*) ;; *) sock="";; esac
   fi
-  set_block "$ODBC_INI" odbc "$DSN" "Description=IRNoti PJSIP realtime
-Driver=$driver
-Server=localhost
-Port=3306
-Database=$DB_NAME${sock:+
-Socket=$sock}$extra"
+  ODBC_DRIVER="$driver" ODBC_SOCK="$sock" ODBC_EXTRA="$extra"
+  write_dsn "$extra"
   set_block "$ASTERISK_DIR/res_odbc.conf" odbc "$DSN" "enabled => yes
 dsn => $DSN
 username => $DB_USER
@@ -496,8 +651,11 @@ step_finish() {
     else service asterisk restart; fi
     sleep 8
     diagnose
-    ast "odbc show" | grep -A4 "$DSN" | grep -Eq 'active connections: [1-9]' \
-      || { warn "the ODBC data source $DSN is not connected: check Socket= and Database= in $ODBC_INI, the user/password in res_odbc.conf and /var/log/asterisk/full"; MANUAL+=("ODBC data source $DSN is not connected"); }
+    if ast "odbc show" | grep -A4 "$DSN" | grep -Eq 'active connections: [1-9]'; then
+      heal_odbc_ints
+    else
+      warn "the ODBC data source $DSN is not connected: check Socket= and Database= in $ODBC_INI, the user/password in res_odbc.conf and /var/log/asterisk/full"; MANUAL+=("ODBC data source $DSN is not connected")
+    fi
   else
     say "Restart Asterisk (service asterisk restart), then check:"
     echo '    asterisk -rx "module show like pjsip_transport_websocket"   # Running'
@@ -507,6 +665,7 @@ step_finish() {
   if [ ${#MANUAL[@]} -gt 0 ]; then
     echo; warn "Needs your attention:"; printf '    - %s\n' "${MANUAL[@]}"
   fi
+  audio_summary
   echo
   if [ "$BEHIND_PROXY" = 1 ]; then
     say "Next: in /admin/providers set on this server  sipDomain, sipWsUrl (wss://YOUR-DOMAIN/ws, the CDN's address) and sipTransport = transport-ws;"
@@ -523,7 +682,7 @@ main() {
       --behind-proxy) BEHIND_PROXY=1; shift;; --bind-http-local) BIND_LOCAL=1; shift;; --proxy-port) PROXY_PORT="$2"; shift 2;;
       --db-name) DB_NAME="$2"; shift 2;; --db-user) DB_USER="$2"; shift 2;; --db-pass) DB_PASS="$2"; shift 2;;
       --mysql-root-pass) MYSQL_ROOT_PASS="$2"; shift 2;; --ast-source) AST_SOURCE="$2"; shift 2;; --schema-sql) SCHEMA_SQL="$2"; shift 2;; --no-prebuilt-schema) PREBUILT=0; shift;; --stun) STUN="$2"; shift 2;; --public-ip) PUBLIC_IP="$2"; shift 2;; --local-ip) LOCAL_IP="$2"; shift 2;;
-      --disable-chan-sip) DISABLE_CHAN_SIP=1; shift;; --restart) RESTART=1; shift;; --skip-db) SKIP_DB=1; shift;;
+      --disable-chan-sip) DISABLE_CHAN_SIP=1; shift;; --restart) RESTART=1; shift;; --no-restart) RESTART=0; shift;; --no-proxy-setup) WEB_PROXY=0; shift;; --no-firewall) FIREWALL=0; shift;; --skip-db) SKIP_DB=1; shift;;
       --check) CHECK_ONLY=1; shift;; --dry-run) DRY=1; shift;; -h|--help) usage; exit 0;;
       *) usage; die "unknown option $1";;
     esac
@@ -533,6 +692,8 @@ main() {
   local ipre='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
   [ -z "$PUBLIC_IP" ] || [[ "$PUBLIC_IP" =~ $ipre ]] || die "--public-ip must be an IPv4 address"
   [ -z "$LOCAL_IP" ] || [[ "$LOCAL_IP" =~ $ipre ]] || die "--local-ip must be an IPv4 address"
+  [ -n "$CERT$KEY" ] || BEHIND_PROXY=1 # no certificate given: a CDN / proxy ends TLS
+  [ "$BEHIND_PROXY" = 0 ] || BIND_LOCAL=1 # behind a proxy only /ws may be reachable: never expose ARI
   if [ "$BEHIND_PROXY" = 1 ] && [ -n "$CERT$KEY" ]; then die "--behind-proxy and --cert/--key exclude each other (TLS is ended in one place)"; fi
   [[ "$DB_NAME$DB_USER" =~ ^[A-Za-z0-9_]+$ ]] || die "database and user names may only contain letters, digits and _"
   if [ -z "$DB_PASS" ]; then DB_PASS="$(openssl rand -hex 16)"; fi
@@ -542,7 +703,8 @@ main() {
   preflight
   if [ "$CHECK_ONLY" = 1 ]; then diagnose; exit 0; fi
   [ "$DRY" = 1 ] && warn "dry run: nothing is changed"
-  step_chan_sip; if [ "$BEHIND_PROXY" = 1 ]; then step_lock_http; step_proxy; else step_tls; step_lock_http; fi; step_transport; step_rtp; step_db; step_odbc; step_sorcery
+  detect_public_ip
+  step_chan_sip; if [ "$BEHIND_PROXY" = 1 ]; then step_lock_http; step_proxy; else step_tls; step_lock_http; fi; step_transport; step_rtp; step_firewall; step_db; step_odbc; step_sorcery
   [ "$DRY" = 1 ] || say "backups of changed files: $BACKUP_DIR"
   step_finish
 }
