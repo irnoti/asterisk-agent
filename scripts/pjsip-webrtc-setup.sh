@@ -1,9 +1,17 @@
 #!/usr/bin/env bash
-# Prepares an Asterisk (16+) server for the IRNoti browser phone: PJSIP over WSS, PJSIP realtime in MySQL/MariaDB (ODBC),
-# and the HTTPS listener the WebSocket rides on. Guide: docs/VOIP-PJSIP-WEBRTC.md in the IRNoti platform repository (dadehnamair/irnoti)
+# pjsip-webrtc-setup.sh: prepares an Asterisk (16+) server for the IRNoti in-page (browser) phone.
 #
-# Every file change sits in a marked block, is backed up first, and can be removed by deleting the block. Re-running is safe.
-# Nothing is restarted unless you pass --restart.
+# The browser registers a PJSIP account over WSS and the platform creates those accounts through ARI, so the PBX needs:
+#   1. a WebSocket entry point: either Asterisk's own HTTPS listener (http.conf), or - with --behind-proxy, when a CDN/reverse
+#      proxy ends TLS - a small proxy in front of Asterisk that forwards only /ws (nothing else is exposed)
+#   2. a PJSIP transport (wss, or ws behind a proxy)   (pjsip_irnoti_ws[s].conf, included from pjsip_custom.conf / pjsip.conf)
+#   3. ICE for the audio path                       (rtp.conf)
+#   4. PJSIP objects stored in a database (realtime): MySQL/MariaDB + ODBC + the ps_* tables from Asterisk's own migrations
+#   5. chan_sip off (optional flag): on Asterisk 16 it blocks PJSIP's WebSocket transport
+#
+# Safe by design: every change sits in a ";--- BEGIN irnoti-pjsip:<name> ---" block, each file is backed up to
+# /var/lib/irnoti-asterisk/pjsip-backup/<time>/ first, re-running replaces the blocks, and nothing is restarted without --restart.
+# Start with --check, then --dry-run. Full documentation: README.md ("Browser phone") and docs/VOIP-PJSIP-WEBRTC.md in dadehnamair/irnoti.
 set -euo pipefail
 
 ASTERISK_DIR="${ASTERISK_DIR:-/etc/asterisk}"
@@ -13,15 +21,20 @@ TAG="irnoti-pjsip"
 DSN="irnoti-pjsip"
 
 CERT="" KEY="" TLS_PORT=8089 DB_NAME="irnoti_pjsip" DB_USER="irnoti_pjsip" DB_PASS="" MYSQL_ROOT_PASS=""
-STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
+BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
 MANUAL=()
 
 usage() {
   cat <<'EOF'
-Usage: pjsip-webrtc-setup.sh --cert FILE --key FILE [options]
+Usage: pjsip-webrtc-setup.sh (--cert FILE --key FILE | --behind-proxy) [options]
 
-  --cert FILE / --key FILE   Certificate (full chain) and private key the browser will trust for your PBX domain.
-  --tls-port N               HTTPS/WSS port of Asterisk (default 8089; use 8443 behind a Cloudflare-style proxy).
+  TLS is ended in one of two places; pick one:
+  --cert FILE / --key FILE   Asterisk ends TLS itself: certificate (full chain) and private key the browser trusts for your domain.
+  --tls-port N               ...on this HTTPS/WSS port (default 8089).
+  --behind-proxy             A CDN / reverse proxy ends TLS (wss://domain/ws -> proxy -> plain ws:// to this PBX). No certificate is
+                             needed here. Asterisk's HTTP server stays on 127.0.0.1 and a proxy forwards only /ws (snippet printed).
+  --proxy-port N             Port the proxy listens on for the CDN (default 8080; Cloudflare reaches origins over HTTP on
+                             80, 8080, 8880, 2052, 2082, 2086, 2095).
   --disable-chan-sip         Add "noload => chan_sip.so". Needed on Asterisk 16, where chan_sip blocks PJSIP's WebSocket
                              transport. THIS STOPS EVERY chan_sip EXTENSION AND TRUNK: use it on a test PBX or after moving them to PJSIP.
   --db-name / --db-user      Database and user for the PJSIP tables (default irnoti_pjsip).
@@ -103,7 +116,8 @@ preflight() {
   [ "${major:-0}" -ge 16 ] || die "Asterisk 16 or newer is required (found: $(asterisk -V))"
   [ "$(module_state res_pjsip)" = "Running" ] || die "res_pjsip is not running on this Asterisk"
   [ "$CHECK_ONLY" = 1 ] && return 0
-  [ -r "$CERT" ] && [ -r "$KEY" ] || die "--cert and --key must point to readable files"
+  if [ "$BEHIND_PROXY" = 1 ]; then return 0; fi
+  [ -r "$CERT" ] && [ -r "$KEY" ] || die "give --cert and --key (Asterisk ends TLS), or --behind-proxy (a CDN/proxy ends TLS)"
   openssl x509 -in "$CERT" -noout >/dev/null 2>&1 || die "$CERT is not a certificate in PEM format"
   # cert and key must be a pair, or every browser connection fails with an unhelpful TLS error
   local a b
@@ -122,6 +136,42 @@ step_chan_sip() {
     warn "Re-run with --disable-chan-sip (test PBX), or move your extensions to PJSIP first. See the guide, section 3."
     MANUAL+=("chan_sip is still loaded: the WebSocket transport will not start until it is disabled")
   fi
+}
+
+step_proxy() {
+  say "WebSocket entry point behind a TLS-ending proxy"
+  # Asterisk serves /ari and /ws from the same HTTP server, so it must not be opened to the network: only /ws may pass
+  local bound; bound="$(ast "http show status" | sed -n 's/.*Bound to \([0-9.]*\):.*/\1/p' | head -1)"
+  if [ -z "$bound" ]; then
+    warn "Asterisk's HTTP server is not running (http show status). Enable it in http.conf (enabled=yes, bindaddr=127.0.0.1)."
+    MANUAL+=("http.conf: enable Asterisk's HTTP server on 127.0.0.1:8088")
+  elif [ "$bound" != "127.0.0.1" ]; then
+    warn "Asterisk's HTTP server listens on $bound, so ARI (/ari) is reachable from the network. Bind it to 127.0.0.1 (http.conf: bindaddr=127.0.0.1) and let the proxy forward only /ws."
+    MANUAL+=("http.conf: bindaddr=$bound exposes ARI; bind to 127.0.0.1")
+  else
+    say "Asterisk HTTP is on 127.0.0.1 (good): ARI stays private"
+  fi
+  cat <<EOT
+
+    Put this in front of Asterisk (nginx; the CDN's origin is http://THIS-SERVER:$PROXY_PORT). It forwards ONLY /ws:
+
+      server {
+        listen $PROXY_PORT;
+        location = /ws {
+          proxy_pass http://127.0.0.1:8088/ws;
+          proxy_http_version 1.1;
+          proxy_set_header Upgrade \$http_upgrade;
+          proxy_set_header Connection "upgrade";
+          proxy_set_header Host \$host;
+          proxy_read_timeout 3600s;
+        }
+        location / { return 404; }
+      }
+
+    Allow $PROXY_PORT/tcp only from the CDN's address ranges. The audio (DTLS-SRTP over UDP) does NOT go through the CDN:
+    it goes straight to this PBX's public IP, so open the RTP range (rtp.conf) to the internet.
+
+EOT
 }
 
 step_tls() {
@@ -144,17 +194,19 @@ tlsprivatekey=$dir/privkey.pem"
 }
 
 step_transport() {
-  say "PJSIP transport-wss"
-  if elsewhere "$ASTERISK_DIR/pjsip.conf" transport '^[[:space:]]*\[transport-wss\]' || elsewhere "$ASTERISK_DIR/pjsip_custom.conf" transport '^[[:space:]]*\[transport-wss\]'; then
-    warn "a [transport-wss] already exists; left alone"; return 0
+  local proto=wss
+  [ "$BEHIND_PROXY" = 1 ] && proto=ws # the proxy hands Asterisk a plain WebSocket
+  say "PJSIP transport-$proto"
+  if elsewhere "$ASTERISK_DIR/pjsip.conf" transport "^[[:space:]]*\\[transport-$proto\\]" || elsewhere "$ASTERISK_DIR/pjsip_custom.conf" transport "^[[:space:]]*\\[transport-$proto\\]"; then
+    warn "a [transport-$proto] already exists; left alone"; return 0
   fi
-  local file="$ASTERISK_DIR/pjsip_irnoti_wss.conf" host="$ASTERISK_DIR/pjsip.conf"
+  local file="$ASTERISK_DIR/pjsip_irnoti_$proto.conf" host="$ASTERISK_DIR/pjsip.conf"
   [ -e "$ASTERISK_DIR/pjsip_custom.conf" ] && host="$ASTERISK_DIR/pjsip_custom.conf" # FreePBX/Issabel regenerate pjsip.conf
   if [ "$DRY" = 1 ]; then echo "    + write $file and include it from $host"; else
-    printf '[transport-wss]\ntype=transport\nprotocol=wss\nbind=0.0.0.0\n' >"$file"
+    printf '[transport-%s]\ntype=transport\nprotocol=%s\nbind=0.0.0.0\n' "$proto" "$proto" >"$file"
     chown "$(stat -c '%U:%G' "$ASTERISK_DIR")" "$file" 2>/dev/null || true
   fi
-  set_block "$host" transport "" '#include "pjsip_irnoti_wss.conf"'
+  set_block "$host" transport "" "#include \"pjsip_irnoti_$proto.conf\""
 }
 
 step_rtp() {
@@ -262,20 +314,26 @@ step_finish() {
   else
     say "Restart Asterisk (service asterisk restart), then check:"
     echo '    asterisk -rx "module show like pjsip_transport_websocket"   # Running'
-    echo '    asterisk -rx "pjsip show transports"                        # transport-wss'
+    echo '    asterisk -rx "pjsip show transports"                        # transport-ws / transport-wss'
     echo '    asterisk -rx "odbc show"                                    # irnoti-pjsip connected'
   fi
   if [ ${#MANUAL[@]} -gt 0 ]; then
     echo; warn "Needs your attention:"; printf '    - %s\n' "${MANUAL[@]}"
   fi
   echo
-  say "Next: in /admin/providers set sipDomain and sipWsUrl (wss://YOUR-DOMAIN:$TLS_PORT/ws) on this server, open $TLS_PORT/tcp and the RTP range (rtp.conf) in the firewall, then create an account in /panel/voip/softphone."
+  if [ "$BEHIND_PROXY" = 1 ]; then
+    say "Next: in /admin/providers set on this server  sipDomain, sipWsUrl (wss://YOUR-DOMAIN/ws, the CDN's address) and sipTransport = transport-ws;"
+    say "      start the proxy above, open the RTP range (rtp.conf) in the firewall, then create an account in /panel/voip/softphone."
+  else
+    say "Next: in /admin/providers set sipDomain and sipWsUrl (wss://YOUR-DOMAIN:$TLS_PORT/ws) on this server, open $TLS_PORT/tcp and the RTP range (rtp.conf) in the firewall, then create an account in /panel/voip/softphone."
+  fi
 }
 
 main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --cert) CERT="$2"; shift 2;; --key) KEY="$2"; shift 2;; --tls-port) TLS_PORT="$2"; shift 2;;
+      --behind-proxy) BEHIND_PROXY=1; shift;; --proxy-port) PROXY_PORT="$2"; shift 2;;
       --db-name) DB_NAME="$2"; shift 2;; --db-user) DB_USER="$2"; shift 2;; --db-pass) DB_PASS="$2"; shift 2;;
       --mysql-root-pass) MYSQL_ROOT_PASS="$2"; shift 2;; --ast-source) AST_SOURCE="$2"; shift 2;; --stun) STUN="$2"; shift 2;;
       --disable-chan-sip) DISABLE_CHAN_SIP=1; shift;; --restart) RESTART=1; shift;; --skip-db) SKIP_DB=1; shift;;
@@ -284,6 +342,8 @@ main() {
     esac
   done
   [[ "$TLS_PORT" =~ ^[0-9]{2,5}$ ]] || die "--tls-port must be a number"
+  [[ "$PROXY_PORT" =~ ^[0-9]{2,5}$ ]] || die "--proxy-port must be a number"
+  if [ "$BEHIND_PROXY" = 1 ] && [ -n "$CERT$KEY" ]; then die "--behind-proxy and --cert/--key exclude each other (TLS is ended in one place)"; fi
   [[ "$DB_NAME$DB_USER" =~ ^[A-Za-z0-9_]+$ ]] || die "database and user names may only contain letters, digits and _"
   if [ -z "$DB_PASS" ]; then DB_PASS="$(openssl rand -hex 16)"; fi
   [[ "$DB_PASS" =~ ^[A-Za-z0-9_.-]+$ ]] || die "--db-pass may only contain letters, digits, _ . -"
@@ -292,7 +352,7 @@ main() {
   preflight
   if [ "$CHECK_ONLY" = 1 ]; then diagnose; exit 0; fi
   [ "$DRY" = 1 ] && warn "dry run: nothing is changed"
-  step_chan_sip; step_tls; step_transport; step_rtp; step_db; step_odbc; step_sorcery
+  step_chan_sip; if [ "$BEHIND_PROXY" = 1 ]; then step_proxy; else step_tls; fi; step_transport; step_rtp; step_db; step_odbc; step_sorcery
   [ "$DRY" = 1 ] || say "backups of changed files: $BACKUP_DIR"
   step_finish
 }
