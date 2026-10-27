@@ -12,6 +12,7 @@ import (
 const (
 	DefaultPath        = "/etc/irnoti-asterisk/agent.json"
 	DefaultAsteriskDir = "/etc/asterisk"
+	DefaultSoundsDir   = "/var/lib/asterisk/sounds"
 	DefaultARIURL      = "http://127.0.0.1:8088"
 	DefaultApp         = "irnoti"
 	DefaultARIUser     = "irnoti"
@@ -29,12 +30,17 @@ type Config struct {
 	App         string `json:"app"`
 	// ExtensionsFile is the dialplan file that carries the managed #include of irnoti/extensions_irnoti.conf.
 	ExtensionsFile string `json:"extensionsFile"`
+	// SoundsDir is where Asterisk reads prompts from; the agent writes only inside its irnoti-sync subdirectory.
+	SoundsDir string `json:"soundsDir"`
 }
 
 // WithDefaults fills the fields an older or hand-written file may leave empty.
 func (c Config) WithDefaults() Config {
 	if c.AsteriskDir == "" {
 		c.AsteriskDir = DefaultAsteriskDir
+	}
+	if c.SoundsDir == "" {
+		c.SoundsDir = DefaultSoundsDir
 	}
 	if c.ARIURL == "" {
 		c.ARIURL = DefaultARIURL

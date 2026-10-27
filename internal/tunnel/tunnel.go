@@ -20,6 +20,7 @@ import (
 	"github.com/irnoti/asterisk-agent/internal/api"
 	"github.com/irnoti/asterisk-agent/internal/ari"
 	"github.com/irnoti/asterisk-agent/internal/proxy"
+	"github.com/irnoti/asterisk-agent/internal/sounds"
 	"github.com/irnoti/asterisk-agent/internal/version"
 )
 
@@ -38,6 +39,12 @@ type ARI interface {
 	Stream(ctx context.Context, app string, emit func(json.RawMessage), state func(up bool), log *slog.Logger)
 }
 
+// SoundsAPI is the part of the protocol that moves prompt files, plus the local directory writer.
+type SoundsAPI interface {
+	Sounds(ctx context.Context) (sounds.Manifest, error)
+	Sound(ctx context.Context, id string) ([]byte, error)
+}
+
 // API is the protocol client (see internal/api).
 type API interface {
 	Hello(ctx context.Context, h api.Hello) (api.HelloResp, error)
@@ -54,12 +61,17 @@ type Agent struct {
 	App  string
 	Log  *slog.Logger
 	Sync func(ctx context.Context, b api.Bundle) (bool, error)
+	// Sounds keeps the managed voice prompts in step with the platform; nil leaves them alone (older setups, tests).
+	Sounds SoundsAPI
+	// SoundDir is Asterisk's sounds directory; empty turns prompt syncing off.
+	SoundDir string
 	// Retry is the wait between failed attempts; tests shorten it.
 	Retry func(attempt int) time.Duration
 
 	started time.Time
 	ariUp   atomic.Bool
 	version atomic.Value // config version last applied
+	sounds  atomic.Value // sound list version last applied completely
 	events  chan json.RawMessage
 	dropped atomic.Int64
 }
@@ -89,11 +101,13 @@ func (a *Agent) Run(ctx context.Context) error {
 	a.started = time.Now()
 	a.events = make(chan json.RawMessage, eventQueueSize)
 	a.version.Store("")
+	a.sounds.Store("")
 
 	if err := a.hello(ctx); err != nil {
 		return err
 	}
 	a.syncConfig(ctx)
+	a.syncSounds(ctx)
 
 	var wg sync.WaitGroup
 	run := func(f func()) { wg.Add(1); go func() { defer wg.Done(); f() }() }
@@ -199,13 +213,39 @@ func (a *Agent) heartbeats(ctx context.Context) {
 }
 
 func (a *Agent) beat(ctx context.Context) {
-	resp, err := a.API.Heartbeat(ctx, api.Heartbeat{Channels: a.ARI.ChannelCount(ctx), AriUp: a.ariUp.Load(), Uptime: int(time.Since(a.started).Seconds())})
+	resp, err := a.API.Heartbeat(ctx, api.Heartbeat{Channels: a.ARI.ChannelCount(ctx), AriUp: a.ariUp.Load(), Uptime: int(time.Since(a.started).Seconds()), SoundsVersion: a.sounds.Load().(string)})
 	if err != nil {
 		a.Log.Warn("heartbeat failed", "err", err)
 		return
 	}
 	if resp.ConfigVersion != "" && resp.ConfigVersion != a.version.Load().(string) {
 		a.syncConfig(ctx)
+	}
+	// an empty version from an older API means "no sound management": leave the prompts alone
+	if a.Sounds != nil && resp.SoundsVersion != "" && resp.SoundsVersion != a.sounds.Load().(string) {
+		a.syncSounds(ctx)
+	}
+}
+
+func (a *Agent) syncSounds(ctx context.Context) {
+	if a.Sounds == nil || a.SoundDir == "" {
+		return
+	}
+	m, err := a.Sounds.Sounds(ctx)
+	if err != nil {
+		a.Log.Warn("cannot fetch the sound list", "err", err)
+		return
+	}
+	s := sounds.Syncer{Dir: a.SoundDir, Fetch: a.Sounds.Sound, Log: a.Log}
+	changed, err := s.Sync(ctx, m)
+	if err != nil {
+		// not recorded as applied, so the next heartbeat tries again
+		a.Log.Error("sounds not fully applied", "version", m.Version, "err", err)
+		return
+	}
+	a.sounds.Store(m.Version)
+	if changed {
+		a.Log.Info("sounds updated", "version", m.Version, "files", len(m.Files))
 	}
 }
 
@@ -299,3 +339,4 @@ func (a *Agent) handle(ctx context.Context, r api.Request) {
 
 var _ ARI = (*ari.Client)(nil)
 var _ API = (*api.Client)(nil)
+var _ SoundsAPI = (*api.Client)(nil)

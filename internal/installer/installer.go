@@ -437,7 +437,7 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/etc/asterisk /var/lib/irnoti-asterisk /etc/irnoti-asterisk
+ReadWritePaths=/etc/asterisk /var/lib/irnoti-asterisk /etc/irnoti-asterisk -/var/lib/asterisk/sounds
 
 [Install]
 WantedBy=multi-user.target
