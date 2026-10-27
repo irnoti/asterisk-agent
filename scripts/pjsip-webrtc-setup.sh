@@ -21,7 +21,7 @@ TAG="irnoti-pjsip"
 DSN="irnoti-pjsip"
 
 CERT="" KEY="" TLS_PORT=8089 DB_NAME="irnoti_pjsip" DB_USER="irnoti_pjsip" DB_PASS="" MYSQL_ROOT_PASS=""
-BIND_LOCAL=0 BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
+SCHEMA_SQL="" BIND_LOCAL=0 BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
 MANUAL=()
 
 usage() {
@@ -45,6 +45,8 @@ Usage: pjsip-webrtc-setup.sh (--cert FILE --key FILE | --behind-proxy) [options]
   --db-pass PASS             Password for that user (letters, digits, _ . - only; generated when omitted).
   --mysql-root-pass PASS     MySQL root password (read from /etc/issabel.conf when present, else a socket login is tried).
   --skip-db                  Do not create the database or tables (they already exist); only wire ODBC and the config files.
+  --schema-sql FILE          Create the ps_* tables from this SQL file instead of running Asterisk's migrations here (no python3 needed
+                             on the PBX). Generate it on any machine with python: see "Schema without python on the PBX" in the README.
   --ast-source DIR           Use this Asterisk source tree for contrib/ast-db-manage instead of downloading it.
   --stun HOST:PORT           STUN server for ICE in rtp.conf (optional).
   --restart                  Restart Asterisk at the end (needed for noload and sorcery changes to take effect).
@@ -123,6 +125,10 @@ check_deps() {
   [ -n "$(odbcinst -q -d 2>/dev/null | grep -iE 'mysql|mariadb')" ] || need "no MySQL/MariaDB ODBC driver registered (odbcinst -q -d): install mysql-connector-odbc / odbc-mariadb$hint"
   [ "$SKIP_DB" = 1 ] && return 0
   command -v mysql >/dev/null || need "mysql client not found (install it, or use --skip-db)$hint"
+  if [ -n "$SCHEMA_SQL" ]; then
+    [ -r "$SCHEMA_SQL" ] || need "--schema-sql $SCHEMA_SQL is not a readable file"
+    return 0
+  fi
   command -v python3 >/dev/null && python3 -c 'import venv, ensurepip' 2>/dev/null || need "python3 with venv/pip is required for Asterisk's database migrations: yum install python3 python3-pip  /  apt install python3-venv python3-pip$hint"
 }
 
@@ -281,7 +287,10 @@ mysql_root() { # sql on stdin
 step_db() {
   [ "$SKIP_DB" = 1 ] && { say "database: skipped"; return 0; }
   say "database $DB_NAME (user $DB_USER)"
-  if [ "$DRY" = 1 ]; then echo "    + create database/user, then run Asterisk's alembic migrations (ps_* tables)"; return 0; fi
+  if [ "$DRY" = 1 ]; then
+    if [ -n "$SCHEMA_SQL" ]; then echo "    + create database/user, then load $SCHEMA_SQL (ps_* tables)"; else echo "    + create database/user, then run the Asterisk alembic migrations (ps_* tables)"; fi
+    return 0
+  fi
   command -v mysql >/dev/null || die "mysql client not found (install it or use --skip-db)"
   # utf8 (not utf8mb4): the longest alembic index would exceed InnoDB's key limit on MariaDB 5.5 / MySQL 5.5
   mysql_root <<<"CREATE DATABASE IF NOT EXISTS \`$DB_NAME\` CHARACTER SET utf8;" || die "cannot log in to MySQL as root (use --mysql-root-pass)"
@@ -290,7 +299,12 @@ step_db() {
   if mysql_root <<<"SHOW TABLES FROM \`$DB_NAME\` LIKE 'ps_endpoints';" | grep -q ps_endpoints; then
     say "tables already exist"; return 0
   fi
-  migrate
+  if [ -n "$SCHEMA_SQL" ]; then
+    say "creating the tables from $SCHEMA_SQL"
+    { printf 'USE `%s`;\n' "$DB_NAME"; cat "$SCHEMA_SQL"; } | mysql_root || die "loading $SCHEMA_SQL failed"
+  else
+    migrate
+  fi
 }
 
 migrate() {
@@ -390,7 +404,7 @@ main() {
       --cert) CERT="$2"; shift 2;; --key) KEY="$2"; shift 2;; --tls-port) TLS_PORT="$2"; shift 2;;
       --behind-proxy) BEHIND_PROXY=1; shift;; --bind-http-local) BIND_LOCAL=1; shift;; --proxy-port) PROXY_PORT="$2"; shift 2;;
       --db-name) DB_NAME="$2"; shift 2;; --db-user) DB_USER="$2"; shift 2;; --db-pass) DB_PASS="$2"; shift 2;;
-      --mysql-root-pass) MYSQL_ROOT_PASS="$2"; shift 2;; --ast-source) AST_SOURCE="$2"; shift 2;; --stun) STUN="$2"; shift 2;;
+      --mysql-root-pass) MYSQL_ROOT_PASS="$2"; shift 2;; --ast-source) AST_SOURCE="$2"; shift 2;; --schema-sql) SCHEMA_SQL="$2"; shift 2;; --stun) STUN="$2"; shift 2;;
       --disable-chan-sip) DISABLE_CHAN_SIP=1; shift;; --restart) RESTART=1; shift;; --skip-db) SKIP_DB=1; shift;;
       --check) CHECK_ONLY=1; shift;; --dry-run) DRY=1; shift;; -h|--help) usage; exit 0;;
       *) usage; die "unknown option $1";;

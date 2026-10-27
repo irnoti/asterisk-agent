@@ -163,6 +163,20 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 
 Anything already configured by hand is left untouched and listed under "Needs your attention" at the end.
 
+### Schema without python on the PBX (`--schema-sql`)
+
+The `ps_*` tables come from Asterisk's own alembic migrations. If the PBX cannot install python3 (for example a CentOS 7 box whose repositories are unreachable), generate the SQL on any other machine with python 3 and hand it to the script. Use the same Asterisk version as the PBX (`asterisk -V`):
+
+```bash
+curl -fsSLO https://downloads.asterisk.org/pub/telephony/asterisk/releases/asterisk-16.7.0.tar.gz
+tar xzf asterisk-16.7.0.tar.gz asterisk-16.7.0/contrib/ast-db-manage && cd asterisk-16.7.0/contrib/ast-db-manage
+python3 -m venv v && v/bin/pip install 'alembic<1.8' 'sqlalchemy<1.5' pymysql
+cp config.ini.sample config.ini && sed -i 's#^sqlalchemy.url.*#sqlalchemy.url = mysql+pymysql://x:x@localhost/x#' config.ini
+v/bin/alembic -c config.ini upgrade head --sql > ps-schema.sql      # offline mode: no database is contacted
+```
+
+Copy `ps-schema.sql` to the PBX and add `--schema-sql ps-schema.sql` to the command. The tables are created in the script's own database (`irnoti_pjsip` by default).
+
 ### TLS ended by a CDN (`--behind-proxy`)
 
 ```
