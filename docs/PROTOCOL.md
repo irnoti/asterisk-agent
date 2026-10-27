@@ -19,7 +19,9 @@ Each request also sends `User-Agent: irnoti-asterisk/<version>`.
 | `POST /poll` | `{}` | `{requests: [{id, method, path, body?}]}`; empty after at most `pollWaitSec` (25) seconds |
 | `POST /respond` | `{id, status, body, encoding, error?}` | `204` |
 | `POST /events` | `{events: [<ARI event>, …]}`, at most 100 | `204` |
-| `POST /heartbeat` | `{channels, ariUp, uptimeSec}` every 30 s | `{configVersion}` |
+| `POST /heartbeat` | `{channels, ariUp, uptimeSec, soundsVersion}` every 30 s | `{configVersion, soundsVersion}` |
+| `GET /sounds` | – | `{version, files: [{id, name, ext, sha256, size}]}` |
+| `GET /sounds/{id}/file` | – | the raw prompt bytes |
 
 Details:
 
@@ -57,6 +59,17 @@ Everything else (event subscriptions, applications, modules, logging, other conf
 A bundle that fails validation is not applied at all, and the agent keeps running with the previous configuration.
 
 Files are written only inside `<asterisk-dir>/irnoti/`. Before any write the agent saves copies of the files it will modify under `/var/lib/irnoti-asterisk/backups/<UTC timestamp>/` with a manifest of the files it creates; if the following `dialplan reload` fails, the previous state is restored.
+
+## Voice prompts (sounds)
+
+The platform manages the prompts used by IVR menus, greetings and campaigns, and the agent keeps them on the PBX. At start-up, and whenever the `soundsVersion` in a heartbeat response differs from the one last applied completely, the agent fetches `GET /sounds` and makes `<sounds-dir>/irnoti-sync/` match the list (`sounds-dir` defaults to `/var/lib/asterisk/sounds`, setting `soundsDir`).
+
+- `name` is `u<userId>/<name>` without extension, `ext` one of `wav`, `sln`, `ulaw`, `alaw`; a prompt is therefore played as `irnoti-sync/u<userId>/<name>`. Names match `^u[0-9]+/[a-z0-9][a-z0-9_-]{0,39}$`; at most 5,000 files of at most 20 MiB each. A list that breaks any rule is refused as a whole.
+- A file is downloaded only when it is missing or its SHA-256 differs; the download must match `sha256` and `size`, or it is discarded and the old file stays. One failing file does not stop the others, but the version is then not reported as applied, so the next heartbeat retries.
+- Files the list no longer contains are deleted, and directories left empty are removed. This applies **only inside `irnoti-sync/`**; anything else in the sounds directory, including a hand-made `irnoti/` folder, is never touched.
+- Files are written through a temporary name and renamed, owned by the owner of the sounds directory so Asterisk can read them. No reload is needed: Asterisk looks files up at play time.
+- The systemd unit lists the sounds directory in `ReadWritePaths`; an agent installed before this feature needs `irnoti-asterisk install` run once more to refresh the unit.
+- A platform that does not send `soundsVersion` leaves the prompts alone.
 
 ## Behaviour when the connection is lost
 

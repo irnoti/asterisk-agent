@@ -12,6 +12,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/irnoti/asterisk-agent/internal/sounds"
 	"github.com/irnoti/asterisk-agent/internal/version"
 )
 
@@ -80,10 +81,13 @@ type Heartbeat struct {
 	Channels int  `json:"channels"`
 	AriUp    bool `json:"ariUp"`
 	Uptime   int  `json:"uptimeSec"`
+	// SoundsVersion is the prompt list last applied here, so the panel can show whether the PBX is up to date.
+	SoundsVersion string `json:"soundsVersion,omitempty"`
 }
 
 type HeartbeatResp struct {
 	ConfigVersion string `json:"configVersion"`
+	SoundsVersion string `json:"soundsVersion,omitempty"`
 }
 
 func (c *Client) do(ctx context.Context, hc *http.Client, method, path string, in, out any) (int, error) {
@@ -166,4 +170,33 @@ func (c *Client) Heartbeat(ctx context.Context, h Heartbeat) (HeartbeatResp, err
 	var out HeartbeatResp
 	_, err := c.do(ctx, c.HTTP, http.MethodPost, "/heartbeat", h, &out)
 	return out, err
+}
+
+// Sounds returns the list of prompts the platform wants on this PBX.
+func (c *Client) Sounds(ctx context.Context) (sounds.Manifest, error) {
+	var out sounds.Manifest
+	_, err := c.do(ctx, c.HTTP, http.MethodGet, "/sounds", nil, &out)
+	return out, err
+}
+
+// Sound downloads one prompt's bytes.
+func (c *Client) Sound(ctx context.Context, id string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.Base+"/sounds/"+id+"/file", nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.Token)
+	req.Header.Set("User-Agent", "irnoti-asterisk/"+version.Version)
+	res, err := c.Long.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer res.Body.Close()
+	if res.StatusCode == http.StatusUnauthorized {
+		return nil, ErrUnauthorized
+	}
+	if res.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("GET /sounds/%s/file: HTTP %d", id, res.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(res.Body, 21<<20))
 }

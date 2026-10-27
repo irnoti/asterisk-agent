@@ -151,9 +151,10 @@ func cmdRun(ctx context.Context, log *slog.Logger, args []string) error {
 		return err
 	}
 	in := newInstaller(c, *cfgPath, log)
+	client := api.New(c.APIURL, c.Token)
 	a := &tunnel.Agent{
-		API: api.New(c.APIURL, c.Token), ARI: ari.New(c.ARIURL, c.ARIUser, c.ARIPassword), App: c.App, Log: log,
-		Sync: in.Sync,
+		API: client, ARI: ari.New(c.ARIURL, c.ARIUser, c.ARIPassword), App: c.App, Log: log,
+		Sync: in.Sync, Sounds: client, SoundDir: c.SoundsDir,
 	}
 	log.Info("irnoti-asterisk started", "version", version.Version)
 	return a.Run(ctx)

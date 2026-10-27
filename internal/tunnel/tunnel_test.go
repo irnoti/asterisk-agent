@@ -2,26 +2,33 @@ package tunnel
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/irnoti/asterisk-agent/internal/api"
+	"github.com/irnoti/asterisk-agent/internal/sounds"
 )
 
 type fakeAPI struct {
-	mu        sync.Mutex
-	helloErrs []error
-	polls     chan []api.Request
-	responses chan api.Response
-	events    chan []json.RawMessage
-	hbVersion string
-	cfgCalls  int
+	mu            sync.Mutex
+	helloErrs     []error
+	polls         chan []api.Request
+	responses     chan api.Response
+	events        chan []json.RawMessage
+	hbVersion     string
+	soundsVersion string
+	cfgCalls      int
 }
 
 func newFakeAPI() *fakeAPI {
@@ -60,7 +67,15 @@ func (f *fakeAPI) Events(_ context.Context, e []json.RawMessage) error {
 	return nil
 }
 func (f *fakeAPI) Heartbeat(context.Context, api.Heartbeat) (api.HeartbeatResp, error) {
-	return api.HeartbeatResp{ConfigVersion: f.hbVersion}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return api.HeartbeatResp{ConfigVersion: f.hbVersion, SoundsVersion: f.soundsVersion}, nil
+}
+
+func (f *fakeAPI) setSoundsVersion(v string) {
+	f.mu.Lock()
+	f.soundsVersion = v
+	f.mu.Unlock()
 }
 
 type fakeARI struct {
@@ -188,4 +203,57 @@ func TestHelloRetriesUntilTheAPIAnswers(t *testing.T) {
 	fa, fr := newFakeAPI(), &fakeARI{status: 200}
 	fa.helloErrs = []error{errors.New("connection refused"), api.ErrUnauthorized}
 	start(t, fa, fr) // start waits for the ARI stream, which only starts after a successful hello
+}
+
+type fakeSounds struct {
+	version atomic.Value
+	files   map[string][]byte
+	listed  atomic.Int32
+}
+
+func (f *fakeSounds) Sounds(context.Context) (sounds.Manifest, error) {
+	f.listed.Add(1)
+	m := sounds.Manifest{Version: f.version.Load().(string)}
+	for id, b := range f.files {
+		h := sha256.Sum256(b)
+		m.Files = append(m.Files, sounds.Item{ID: id, Name: "u1/p" + id, Ext: "wav", Sha256: hex.EncodeToString(h[:]), Size: len(b)})
+	}
+	return m, nil
+}
+func (f *fakeSounds) Sound(_ context.Context, id string) ([]byte, error) { return f.files[id], nil }
+
+func TestSoundsAreSyncedAtStartAndWhenTheHeartbeatReportsANewVersion(t *testing.T) {
+	fa, fr := newFakeAPI(), &fakeARI{status: 200}
+	fs := &fakeSounds{files: map[string][]byte{"1": []byte("one")}}
+	fs.version.Store("s1")
+	dir := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	fr.started = make(chan struct{})
+	a := &Agent{API: fa, ARI: fr, App: "irnoti", Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Retry: func(int) time.Duration { return time.Millisecond },
+		Sounds: fs, SoundDir: dir}
+	done := make(chan struct{})
+	go func() { _ = a.Run(ctx); close(done) }()
+	t.Cleanup(func() { cancel(); <-done })
+	<-fr.started
+
+	want := filepath.Join(dir, sounds.Subdir, "u1", "p1.wav")
+	if got, err := os.ReadFile(want); err != nil || string(got) != "one" {
+		t.Fatalf("startup sync: %q %v", got, err)
+	}
+
+	// the platform publishes a new list; the next heartbeat carries its version
+	fs.files["2"] = []byte("two")
+	fs.version.Store("s2")
+	fa.setSoundsVersion("s2")
+	a.beat(ctx)
+	if got, err := os.ReadFile(filepath.Join(dir, sounds.Subdir, "u1", "p2.wav")); err != nil || string(got) != "two" {
+		t.Fatalf("heartbeat sync: %q %v", got, err)
+	}
+
+	// same version again: no second download of the list
+	before := fs.listed.Load()
+	a.beat(ctx)
+	if fs.listed.Load() != before {
+		t.Error("an unchanged version must not trigger a sync")
+	}
 }
