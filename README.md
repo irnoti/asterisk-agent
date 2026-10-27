@@ -146,6 +146,7 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 | `--schema-sql FILE` | Create the tables from this SQL file instead of the prebuilt one (it may only contain table creation; anything else is refused because it runs as the database root). |
 | `--no-prebuilt-schema` | Do not download the prebuilt file; run Asterisk's migrations on this PBX (needs `python3`). |
 | `--ast-source DIR` | With the migrations: use this Asterisk source tree for `contrib/ast-db-manage` instead of downloading it. |
+| `--public-ip IP`, `--local-ip IP` | The PBX is behind a one-to-one NAT (port forwards): ICE then offers this public address instead of the private one (`[ice_host_candidates]` in `rtp.conf`). `--local-ip` defaults to the address of the default route. Use it instead of `--stun`. |
 | `--stun HOST:PORT` | STUN server for ICE (`rtp.conf`). |
 | `--restart` | Restart Asterisk at the end. `noload` and the realtime mapping only take effect after a restart (a reload is not enough). |
 | `--check` | Report the state (Asterisk version, module states, transports, ODBC); change nothing. |
@@ -183,6 +184,7 @@ browser <==== audio: DTLS-SRTP over UDP, straight to the PBX's public IP (never 
 - Asterisk serves `/ari` and `/ws` from the **same** HTTP server, so never open it to the network. Keep `bindaddr=127.0.0.1` and put a small proxy in front that forwards **only** `/ws` (the script prints an nginx snippet and warns if Asterisk is bound elsewhere).
 - Allow the proxy port only from the CDN's address ranges. Cloudflare reaches an origin over HTTP only on ports 80, 8080, 8880, 2052, 2082, 2086, 2095; WebSockets must be enabled for the zone.
 - The audio does not go through the CDN: the PBX needs a public IP with the RTP range (`rtp.conf`) open, plus `external_media_address`/`external_signaling_address` on the transport if it is behind NAT.
+- **Behind NAT** (a router forwarding ports to the PBX): forward the proxy port (default 8080/tcp, from the CDN's addresses only) and the RTP range from `rtp.conf` (UDP) to the PBX, and run the script with `--public-ip <public IPv4>`, otherwise an outside browser is offered the private address and the audio never connects. Do not forward Asterisk's own HTTP/HTTPS ports (8088/8089): they also serve `/ari`.
 - In the platform admin set `sipWsUrl` to `wss://pbx.example.com/ws` (no port) and `sipTransport` to `transport-ws`, because Asterisk sees a plain WebSocket.
 
 ### Safety

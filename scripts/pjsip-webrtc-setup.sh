@@ -22,7 +22,7 @@ TAG="irnoti-pjsip"
 DSN="irnoti-pjsip"
 
 CERT="" KEY="" TLS_PORT=8089 DB_NAME="irnoti_pjsip" DB_USER="irnoti_pjsip" DB_PASS="" MYSQL_ROOT_PASS=""
-SCHEMA_SQL="" SCHEMA_PLAN="" PREBUILT=1 BIND_LOCAL=0 BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
+PUBLIC_IP="" LOCAL_IP="" SCHEMA_SQL="" SCHEMA_PLAN="" PREBUILT=1 BIND_LOCAL=0 BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
 MANUAL=()
 
 usage() {
@@ -50,6 +50,9 @@ Usage: pjsip-webrtc-setup.sh (--cert FILE --key FILE | --behind-proxy) [options]
                              file for this Asterisk version (scripts/pjsip-schema/), so neither python3 nor Asterisk's source is needed.
   --no-prebuilt-schema       Do not use the prebuilt file; run Asterisk's own alembic migrations on this PBX (needs python3 + pip).
   --ast-source DIR           Use this Asterisk source tree for contrib/ast-db-manage instead of downloading it.
+  --public-ip IP             The PBX sits behind a one-to-one NAT (port forwards) with this public IPv4: ICE then advertises it instead of
+                             the private address ([ice_host_candidates] in rtp.conf). Use it instead of --stun. --local-ip IP names the
+                             private address (default: the one used for the default route).
   --stun HOST:PORT           STUN server for ICE in rtp.conf (optional).
   --restart                  Restart Asterisk at the end (needed for noload and sorcery changes to take effect).
   --check                    Only report the state of this server; change nothing.
@@ -333,9 +336,25 @@ step_transport() {
 
 step_rtp() {
   say "rtp.conf (ICE for WebRTC)"
-  if elsewhere "$ASTERISK_DIR/rtp.conf" rtp '^[[:space:]]*icesupport'; then return 0; fi
-  set_block "$ASTERISK_DIR/rtp.conf" rtp general "icesupport=yes${STUN:+
-stunaddr=$STUN}"
+  local stun="$STUN"
+  if [ -n "$PUBLIC_IP" ] && [ -n "$STUN" ]; then warn "--stun is ignored with --public-ip (Asterisk advises against mixing them behind a one-to-one NAT)"; stun=""; fi
+  if ! elsewhere "$ASTERISK_DIR/rtp.conf" rtp '^[[:space:]]*icesupport'; then
+    set_block "$ASTERISK_DIR/rtp.conf" rtp general "icesupport=yes${stun:+
+stunaddr=$stun}"
+  fi
+  [ -n "$PUBLIC_IP" ] || return 0
+  # behind NAT Asterisk would otherwise offer only its private address as the ICE host candidate, which an outside browser cannot reach
+  local lip="$LOCAL_IP"
+  [ -n "$lip" ] || lip="$(ip -4 route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -1)"
+  if [ -z "$lip" ]; then
+    warn "cannot tell the PBX's private address; pass --local-ip"; MANUAL+=("rtp.conf: add [ice_host_candidates] with  <private-ip> => $PUBLIC_IP")
+    return 0
+  fi
+  if elsewhere "$ASTERISK_DIR/rtp.conf" icehost '^\[ice_host_candidates\]'; then
+    warn "rtp.conf already has [ice_host_candidates]; left alone"; MANUAL+=("rtp.conf: map $lip => $PUBLIC_IP in [ice_host_candidates]")
+    return 0
+  fi
+  set_block "$ASTERISK_DIR/rtp.conf" icehost ice_host_candidates "$lip => $PUBLIC_IP"
 }
 
 mysql_root() { # sql on stdin
@@ -489,7 +508,7 @@ main() {
       --cert) CERT="$2"; shift 2;; --key) KEY="$2"; shift 2;; --tls-port) TLS_PORT="$2"; shift 2;;
       --behind-proxy) BEHIND_PROXY=1; shift;; --bind-http-local) BIND_LOCAL=1; shift;; --proxy-port) PROXY_PORT="$2"; shift 2;;
       --db-name) DB_NAME="$2"; shift 2;; --db-user) DB_USER="$2"; shift 2;; --db-pass) DB_PASS="$2"; shift 2;;
-      --mysql-root-pass) MYSQL_ROOT_PASS="$2"; shift 2;; --ast-source) AST_SOURCE="$2"; shift 2;; --schema-sql) SCHEMA_SQL="$2"; shift 2;; --no-prebuilt-schema) PREBUILT=0; shift;; --stun) STUN="$2"; shift 2;;
+      --mysql-root-pass) MYSQL_ROOT_PASS="$2"; shift 2;; --ast-source) AST_SOURCE="$2"; shift 2;; --schema-sql) SCHEMA_SQL="$2"; shift 2;; --no-prebuilt-schema) PREBUILT=0; shift;; --stun) STUN="$2"; shift 2;; --public-ip) PUBLIC_IP="$2"; shift 2;; --local-ip) LOCAL_IP="$2"; shift 2;;
       --disable-chan-sip) DISABLE_CHAN_SIP=1; shift;; --restart) RESTART=1; shift;; --skip-db) SKIP_DB=1; shift;;
       --check) CHECK_ONLY=1; shift;; --dry-run) DRY=1; shift;; -h|--help) usage; exit 0;;
       *) usage; die "unknown option $1";;
@@ -497,6 +516,9 @@ main() {
   done
   [[ "$TLS_PORT" =~ ^[0-9]{2,5}$ ]] || die "--tls-port must be a number"
   [[ "$PROXY_PORT" =~ ^[0-9]{2,5}$ ]] || die "--proxy-port must be a number"
+  local ipre='^([0-9]{1,3}\.){3}[0-9]{1,3}$'
+  [ -z "$PUBLIC_IP" ] || [[ "$PUBLIC_IP" =~ $ipre ]] || die "--public-ip must be an IPv4 address"
+  [ -z "$LOCAL_IP" ] || [[ "$LOCAL_IP" =~ $ipre ]] || die "--local-ip must be an IPv4 address"
   if [ "$BEHIND_PROXY" = 1 ] && [ -n "$CERT$KEY" ]; then die "--behind-proxy and --cert/--key exclude each other (TLS is ended in one place)"; fi
   [[ "$DB_NAME$DB_USER" =~ ^[A-Za-z0-9_]+$ ]] || die "database and user names may only contain letters, digits and _"
   if [ -z "$DB_PASS" ]; then DB_PASS="$(openssl rand -hex 16)"; fi
