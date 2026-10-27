@@ -400,7 +400,15 @@ migrate() {
 step_odbc() {
   say "ODBC data source $DSN"
   local driver
-  driver="$(odbcinst -q -d 2>/dev/null | tr -d '[]' | grep -iE 'mysql|mariadb' | head -1 || true)"
+  # Asterisk is documented against the ANSI flavour of MySQL's driver (the Unicode one can garble data), so prefer it
+  local drivers; drivers="$(odbcinst -q -d 2>/dev/null | tr -d '[]' | grep -iE 'mysql|mariadb' || true)"
+  driver="$(printf '%s\n' "$drivers" | grep -i ansi | head -1 || true)"
+  [ -n "$driver" ] || driver="$(printf '%s\n' "$drivers" | head -1)"
+  local extra=""
+  # same options as the DSNs Issabel creates itself for Asterisk (FOUND_ROWS + big packets, utf8)
+  case "$driver" in *"MySQL ODBC"*) extra="
+option=3
+charset=utf8";; esac
   if [ -z "$driver" ]; then
     [ "$DRY" = 1 ] && { warn "no MySQL/MariaDB ODBC driver registered (a real run stops here)"; driver="MariaDB"; } \
       || die "no MySQL/MariaDB ODBC driver registered (yum install mysql-connector-odbc  /  apt install odbc-mariadb)"
@@ -417,7 +425,7 @@ Driver=$driver
 Server=localhost
 Port=3306
 Database=$DB_NAME${sock:+
-Socket=$sock}"
+Socket=$sock}$extra"
   set_block "$ASTERISK_DIR/res_odbc.conf" odbc "$DSN" "enabled => yes
 dsn => $DSN
 username => $DB_USER
