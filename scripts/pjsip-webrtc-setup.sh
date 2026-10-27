@@ -21,7 +21,7 @@ TAG="irnoti-pjsip"
 DSN="irnoti-pjsip"
 
 CERT="" KEY="" TLS_PORT=8089 DB_NAME="irnoti_pjsip" DB_USER="irnoti_pjsip" DB_PASS="" MYSQL_ROOT_PASS=""
-BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
+BIND_LOCAL=0 BEHIND_PROXY=0 PROXY_PORT=8080 STUN="" DISABLE_CHAN_SIP=0 RESTART=0 DRY=0 SKIP_DB=0 CHECK_ONLY=0 AST_SOURCE=""
 MANUAL=()
 
 usage() {
@@ -33,6 +33,10 @@ Usage: pjsip-webrtc-setup.sh (--cert FILE --key FILE | --behind-proxy) [options]
   --tls-port N               ...on this HTTPS/WSS port (default 8089).
   --behind-proxy             A CDN / reverse proxy ends TLS (wss://domain/ws -> proxy -> plain ws:// to this PBX). No certificate is
                              needed here. Asterisk's HTTP server stays on 127.0.0.1 and a proxy forwards only /ws (snippet printed).
+  --bind-http-local          Bind Asterisk's HTTP server to 127.0.0.1 (and, with --behind-proxy, switch its HTTPS listener off) so /ari is
+                             not reachable from the network. Written to http_custom.conf when http.conf includes it (FreePBX/Issabel
+                             regenerate http_additional.conf, which a later include overrides), else to http.conf.
+                             Skip it if IP phones fetch provisioning files from this PBX's HTTP port.
   --proxy-port N             Port the proxy listens on for the CDN (default 8080; Cloudflare reaches origins over HTTP on
                              80, 8080, 8880, 2052, 2082, 2086, 2095).
   --disable-chan-sip         Add "noload => chan_sip.so". Needed on Asterisk 16, where chan_sip blocks PJSIP's WebSocket
@@ -55,6 +59,11 @@ die()  { printf '\033[1;31mxx\033[0m  %s\n' "$*" >&2; exit 1; }
 run()  { if [ "$DRY" = 1 ]; then echo "    + $*"; else "$@"; fi; }
 ast()  { asterisk -rx "$1" 2>&1 || true; }
 # "Not Running" also contains "Running", so the negative is tested first
+# A missing prerequisite stops a real run before anything is changed; a dry run only reports it.
+need() { if [ "$DRY" = 1 ]; then warn "$1 (a real run stops here)"; else die "$1"; fi; }
+http_target() { # the file our HTTP settings go to: http_custom.conf when http.conf includes it (it is read last)
+  if grep -Eq '^#include[[:space:]]+"?http_custom\.conf' "$ASTERISK_DIR/http.conf" 2>/dev/null; then echo "$ASTERISK_DIR/http_custom.conf"; else echo "$ASTERISK_DIR/http.conf"; fi
+}
 module_state() { local l; l="$(ast "module show like $1" | grep -F "$1.so" | head -1)"; case "$l" in "") echo "not available";; *"Not Running"*) echo "Not Running";; *) echo "Running";; esac; }
 
 # ───────── config-file blocks ─────────
@@ -108,6 +117,15 @@ diagnose() {
   echo "    ODBC:"; ast "odbc show" | sed 's/^/      /' | head -8
 }
 
+check_deps() {
+  local hint=""
+  grep -qs 'release 7' /etc/centos-release 2>/dev/null && hint=" (CentOS 7 is end-of-life: point /etc/yum.repos.d/CentOS-*.repo at vault.centos.org first, see the guide)"
+  [ -n "$(odbcinst -q -d 2>/dev/null | grep -iE 'mysql|mariadb')" ] || need "no MySQL/MariaDB ODBC driver registered (odbcinst -q -d): install mysql-connector-odbc / odbc-mariadb$hint"
+  [ "$SKIP_DB" = 1 ] && return 0
+  command -v mysql >/dev/null || need "mysql client not found (install it, or use --skip-db)$hint"
+  command -v python3 >/dev/null && python3 -c 'import venv, ensurepip' 2>/dev/null || need "python3 with venv/pip is required for Asterisk's database migrations: yum install python3 python3-pip  /  apt install python3-venv python3-pip$hint"
+}
+
 preflight() {
   [ "$(id -u)" = 0 ] || [ "$DRY" = 1 ] || [ "$CHECK_ONLY" = 1 ] || die "run as root"
   command -v asterisk >/dev/null || die "asterisk not found in PATH"
@@ -116,6 +134,7 @@ preflight() {
   [ "${major:-0}" -ge 16 ] || die "Asterisk 16 or newer is required (found: $(asterisk -V))"
   [ "$(module_state res_pjsip)" = "Running" ] || die "res_pjsip is not running on this Asterisk"
   [ "$CHECK_ONLY" = 1 ] && return 0
+  check_deps
   if [ "$BEHIND_PROXY" = 1 ]; then return 0; fi
   [ -r "$CERT" ] && [ -r "$KEY" ] || die "give --cert and --key (Asterisk ends TLS), or --behind-proxy (a CDN/proxy ends TLS)"
   openssl x509 -in "$CERT" -noout >/dev/null 2>&1 || die "$CERT is not a certificate in PEM format"
@@ -149,7 +168,7 @@ step_proxy() {
     warn "Asterisk's HTTP server is not running (http show status). Enable it in http.conf (enabled=yes, bindaddr=127.0.0.1)."
     MANUAL+=("http.conf: enable Asterisk's HTTP server on 127.0.0.1:$hport")
   elif [ "$bound" != "127.0.0.1" ]; then
-    warn "Asterisk's HTTP server listens on $bound, so ARI (/ari) is reachable from the network. Bind it to 127.0.0.1 (http.conf: bindaddr=127.0.0.1) and let the proxy forward only /ws."
+    warn "Asterisk's HTTP server listens on $bound, so ARI (/ari) is reachable from the network. Re-run with --bind-http-local (or set bindaddr=127.0.0.1 in http_custom.conf) and let the proxy forward only /ws."
     MANUAL+=("http.conf: bindaddr=$bound exposes ARI; bind to 127.0.0.1")
   else
     say "Asterisk HTTP is on 127.0.0.1 (good)"
@@ -157,7 +176,7 @@ step_proxy() {
   # the TLS listener serves the same /ari, so it must not face the network either
   local tls; tls="$(ast "http show status" | sed -n 's/.*HTTPS Server Enabled and Bound to \([0-9.]*\):\([0-9]*\).*/\1:\2/p' | head -1)"
   if [ -n "$tls" ] && [ "${tls%%:*}" != "127.0.0.1" ]; then
-    warn "Asterisk's HTTPS server is enabled on $tls and serves /ari too. With a proxy in front it is not needed: remove tlsenable/tlsbindaddr from http.conf (or an included http_*.conf), or bind it to 127.0.0.1."
+    warn "Asterisk's HTTPS server is enabled on $tls and serves /ari too. With a proxy in front it is not needed: --bind-http-local switches it off (or remove tlsenable from http.conf / http_additional.conf / http_custom.conf)."
     MANUAL+=("http.conf: HTTPS listener on $tls exposes ARI; disable it or bind to 127.0.0.1")
   fi
   cat <<EOT
@@ -177,6 +196,21 @@ step_proxy() {
         location / { return 404; }
       }
 
+    No nginx (e.g. CentOS 7 without EPEL)? Apache can do the same: put this in /etc/httpd/conf.d/irnoti-ws.conf, then
+    "httpd -t && service httpd reload" (needs mod_proxy and mod_proxy_wstunnel: httpd -M | grep proxy):
+
+      Listen $PROXY_PORT
+      <VirtualHost *:$PROXY_PORT>
+        ProxyRequests Off
+        <Location "/">
+          Require all denied
+        </Location>
+        <Location "/ws">
+          Require all granted
+          ProxyPass "ws://127.0.0.1:$hport/ws"
+        </Location>
+      </VirtualHost>
+
     Allow $PROXY_PORT/tcp only from the CDN's address ranges. The audio (DTLS-SRTP over UDP) does NOT go through the CDN:
     it goes straight to this PBX's public IP, so open the RTP range (rtp.conf) to the internet.
 
@@ -191,15 +225,28 @@ step_tls() {
   run install -m 0644 "$CERT" "$dir/fullchain.pem"
   run install -m 0640 "$KEY" "$dir/privkey.pem"
   run chown -R "$owner" "$dir"
-  if elsewhere "$ASTERISK_DIR/http.conf" tls '^[[:space:]]*tlsenable'; then
-    warn "http.conf already has a TLS listener; left alone. Check that it uses port $TLS_PORT and a certificate the browser trusts."
-    MANUAL+=("http.conf already defines tlsenable: verify its port/certificate")
+  local target hdr=""; target="$(http_target)"; [ "$target" = "$ASTERISK_DIR/http.conf" ] && hdr=general
+  if elsewhere "$target" tls '^[[:space:]]*tlsenable'; then
+    warn "$target already has a TLS listener; left alone. Check that it uses port $TLS_PORT and a certificate the browser trusts."
+    MANUAL+=("$target already defines tlsenable: verify its port/certificate")
     return 0
   fi
-  set_block "$ASTERISK_DIR/http.conf" tls general "tlsenable=yes
+  # included files are read after http.conf's own lines, so these win over FreePBX's generated http_additional.conf
+  set_block "$target" tls "$hdr" "tlsenable=yes
 tlsbindaddr=0.0.0.0:$TLS_PORT
 tlscertfile=$dir/fullchain.pem
 tlsprivatekey=$dir/privkey.pem"
+}
+
+step_lock_http() {
+  [ "$BIND_LOCAL" = 1 ] || return 0
+  say "Binding Asterisk's HTTP server to 127.0.0.1"
+  local target hdr=""; target="$(http_target)"; [ "$target" = "$ASTERISK_DIR/http.conf" ] && hdr=general
+  local body="bindaddr=127.0.0.1"
+  [ "$BEHIND_PROXY" = 1 ] && body="$body
+tlsenable=no"
+  set_block "$target" httplocal "$hdr" "$body"
+  [ "$DRY" = 1 ] || ast "module reload http" >/dev/null
 }
 
 step_transport() {
@@ -248,7 +295,6 @@ step_db() {
 
 migrate() {
   # Asterisk's own migrations are the only schema that is guaranteed to match what it reads and writes
-  command -v python3 >/dev/null || { command -v yum >/dev/null && yum -y install python3 || die "python3 is required"; }
   local work="$STATE_DIR/pjsip-schema" src="$AST_SOURCE" ver
   mkdir -p "$work"
   if [ -z "$src" ]; then
@@ -342,7 +388,7 @@ main() {
   while [ $# -gt 0 ]; do
     case "$1" in
       --cert) CERT="$2"; shift 2;; --key) KEY="$2"; shift 2;; --tls-port) TLS_PORT="$2"; shift 2;;
-      --behind-proxy) BEHIND_PROXY=1; shift;; --proxy-port) PROXY_PORT="$2"; shift 2;;
+      --behind-proxy) BEHIND_PROXY=1; shift;; --bind-http-local) BIND_LOCAL=1; shift;; --proxy-port) PROXY_PORT="$2"; shift 2;;
       --db-name) DB_NAME="$2"; shift 2;; --db-user) DB_USER="$2"; shift 2;; --db-pass) DB_PASS="$2"; shift 2;;
       --mysql-root-pass) MYSQL_ROOT_PASS="$2"; shift 2;; --ast-source) AST_SOURCE="$2"; shift 2;; --stun) STUN="$2"; shift 2;;
       --disable-chan-sip) DISABLE_CHAN_SIP=1; shift;; --restart) RESTART=1; shift;; --skip-db) SKIP_DB=1; shift;;
@@ -361,7 +407,7 @@ main() {
   preflight
   if [ "$CHECK_ONLY" = 1 ]; then diagnose; exit 0; fi
   [ "$DRY" = 1 ] && warn "dry run: nothing is changed"
-  step_chan_sip; if [ "$BEHIND_PROXY" = 1 ]; then step_proxy; else step_tls; fi; step_transport; step_rtp; step_db; step_odbc; step_sorcery
+  step_chan_sip; if [ "$BEHIND_PROXY" = 1 ]; then step_lock_http; step_proxy; else step_tls; step_lock_http; fi; step_transport; step_rtp; step_db; step_odbc; step_sorcery
   [ "$DRY" = 1 ] || say "backups of changed files: $BACKUP_DIR"
   step_finish
 }
