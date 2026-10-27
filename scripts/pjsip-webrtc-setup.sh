@@ -1,9 +1,16 @@
 #!/usr/bin/env bash
-# Prepares an Asterisk (16+) server for the IRNoti browser phone: PJSIP over WSS, PJSIP realtime in MySQL/MariaDB (ODBC),
-# and the HTTPS listener the WebSocket rides on. Guide: docs/VOIP-PJSIP-WEBRTC.md in the IRNoti platform repository (dadehnamair/irnoti)
+# pjsip-webrtc-setup.sh: prepares an Asterisk (16+) server for the IRNoti in-page (browser) phone.
 #
-# Every file change sits in a marked block, is backed up first, and can be removed by deleting the block. Re-running is safe.
-# Nothing is restarted unless you pass --restart.
+# The browser registers a PJSIP account over WSS and the platform creates those accounts through ARI, so the PBX needs:
+#   1. an HTTPS listener for the WebSocket          (http.conf)
+#   2. a PJSIP transport-wss                        (pjsip_irnoti_wss.conf, included from pjsip_custom.conf / pjsip.conf)
+#   3. ICE for the audio path                       (rtp.conf)
+#   4. PJSIP objects stored in a database (realtime): MySQL/MariaDB + ODBC + the ps_* tables from Asterisk's own migrations
+#   5. chan_sip off (optional flag): on Asterisk 16 it blocks PJSIP's WebSocket transport
+#
+# Safe by design: every change sits in a ";--- BEGIN irnoti-pjsip:<name> ---" block, each file is backed up to
+# /var/lib/irnoti-asterisk/pjsip-backup/<time>/ first, re-running replaces the blocks, and nothing is restarted without --restart.
+# Start with --check, then --dry-run. Full documentation: README.md ("Browser phone") and docs/VOIP-PJSIP-WEBRTC.md in dadehnamair/irnoti.
 set -euo pipefail
 
 ASTERISK_DIR="${ASTERISK_DIR:-/etc/asterisk}"
