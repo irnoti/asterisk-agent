@@ -95,7 +95,7 @@ func TestInstallFreshServer(t *testing.T) {
 	if st, _ := os.Stat(in.ConfigPath); st.Mode().Perm() != 0o600 {
 		t.Errorf("agent.json holds the token, mode is %v", st.Mode().Perm())
 	}
-	want := []string{"asterisk -rx module reload http", "asterisk -rx module reload res_ari.so", "asterisk -rx dialplan reload", "systemctl daemon-reload", "systemctl enable --now irnoti-asterisk"}
+	want := []string{"asterisk -rx module reload http", "asterisk -rx module reload res_ari.so", "asterisk -rx dialplan reload", "systemctl --version", "systemctl daemon-reload", "systemctl enable --now irnoti-asterisk"}
 	if strings.Join(r.calls, "|") != strings.Join(want, "|") {
 		t.Errorf("commands = %v", r.calls)
 	}

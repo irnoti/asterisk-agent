@@ -422,8 +422,35 @@ func (in *Installer) binary() string {
 	return defaultBinary
 }
 
+// rwDirective is the unit setting that lists writable paths: systemd 231 renamed ReadWriteDirectories to ReadWritePaths, and older
+// systemd (CentOS 7 ships 219) rejects the new name with "Unknown lvalue", leaving the whole service read-only.
+func rwDirective(systemdVersion int) string {
+	if systemdVersion > 0 && systemdVersion < 231 {
+		return "ReadWriteDirectories"
+	}
+	return "ReadWritePaths"
+}
+
+// systemdVersion reads the number from `systemctl --version` ("systemd 219"); 0 when it cannot be told.
+func systemdVersion(out string) int {
+	f := strings.Fields(out)
+	if len(f) < 2 || f[0] != "systemd" {
+		return 0
+	}
+	n, err := strconv.Atoi(f[1])
+	if err != nil {
+		return 0
+	}
+	return n
+}
+
 // UnitFile is the systemd service. It runs as root only because it edits /etc/asterisk and reloads Asterisk; everything else is locked down.
-func UnitFile(binary, configPath string) string {
+// soundsDir is listed only when it exists: a path that is missing makes older systemd refuse to start the service.
+func UnitFile(binary, configPath string, systemdVersion int, soundsDir string) string {
+	paths := []string{"/etc/asterisk", "/var/lib/irnoti-asterisk", "/etc/irnoti-asterisk"}
+	if st, err := os.Stat(soundsDir); err == nil && st.IsDir() {
+		paths = append(paths, soundsDir)
+	}
 	return fmt.Sprintf(`[Unit]
 Description=IRNoti Asterisk agent
 After=network-online.target asterisk.service
@@ -437,15 +464,23 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/etc/asterisk /var/lib/irnoti-asterisk /etc/irnoti-asterisk -/var/lib/asterisk/sounds
+%s=%s
 
 [Install]
 WantedBy=multi-user.target
-`, binary, configPath)
+`, binary, configPath, rwDirective(systemdVersion), strings.Join(paths, " "))
+}
+
+func (in *Installer) soundsDir() string {
+	if in.Cfg.SoundsDir != "" {
+		return in.Cfg.SoundsDir
+	}
+	return config.DefaultSoundsDir
 }
 
 func (in *Installer) installService(ctx context.Context) error {
-	if err := os.WriteFile(in.unitPath(), []byte(UnitFile(in.binary(), in.ConfigPath)), 0o644); err != nil {
+	out, _ := in.Runner.Run(ctx, "systemctl", "--version")
+	if err := os.WriteFile(in.unitPath(), []byte(UnitFile(in.binary(), in.ConfigPath, systemdVersion(out), in.soundsDir())), 0o644); err != nil {
 		return err
 	}
 	for _, args := range [][]string{{"daemon-reload"}, {"enable", "--now", "irnoti-asterisk"}} {
