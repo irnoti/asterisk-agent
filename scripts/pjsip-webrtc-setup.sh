@@ -449,6 +449,12 @@ audio_summary() {
   echo
   say "Audio does not go through the CDN. On your router/firewall (MikroTik: IP > Firewall > NAT, chain dstnat), forward:"
   echo "      UDP $a-$b   $PUBLIC_IP  ->  ${lip:-this PBX}   (protocol udp, NOT tcp)"
+  echo "    If the router has several public IPs, the PBX's audio must also LEAVE from $PUBLIC_IP, or the browser's NAT drops it (one-way audio:"
+  echo "    the other party is not heard in the browser). MikroTik, above the masquerade rule:"
+  echo "      /ip firewall nat add chain=srcnat src-address=${lip:-PBX-IP} protocol=udp src-port=$a-$b action=src-nat to-addresses=$PUBLIC_IP place-before=0"
+  echo "    If the router has several public IPs, the PBX's audio must also LEAVE from $PUBLIC_IP, or the browser's NAT drops it (one-way audio:"
+  echo "    the other party is heard by nobody here). MikroTik, above the masquerade rule:"
+  echo "      /ip firewall nat add chain=srcnat src-address=${lip:-PBX-IP} protocol=udp src-port=$a-$b action=src-nat to-addresses=$PUBLIC_IP place-before=0"
 }
 
 step_tls() {
