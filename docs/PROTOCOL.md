@@ -68,7 +68,7 @@ The platform manages the prompts used by IVR menus, greetings and campaigns, and
 - A file is downloaded only when it is missing or its SHA-256 differs; the download must match `sha256` and `size`, or it is discarded and the old file stays. One failing file does not stop the others, but the version is then not reported as applied, so the next heartbeat retries.
 - Files the list no longer contains are deleted, and directories left empty are removed. This applies **only inside `irnoti-sync/`**; anything else in the sounds directory, including a hand-made `irnoti/` folder, is never touched.
 - Files are written through a temporary name and renamed, owned by the owner of the sounds directory so Asterisk can read them. No reload is needed: Asterisk looks files up at play time.
-- The systemd unit lists the sounds directory in `ReadWritePaths`; an agent installed before this feature needs `irnoti-asterisk install` run once more to refresh the unit.
+- The systemd unit lists the sounds directory as writable (`ReadWritePaths`, or `ReadWriteDirectories` on systemd older than 231 such as CentOS 7, which rejects the new name and would leave `/etc/asterisk` read-only); an agent installed before this feature needs `irnoti-asterisk install` run once more to refresh the unit.
 - A platform that does not send `soundsVersion` leaves the prompts alone.
 
 ## Behaviour when the connection is lost
