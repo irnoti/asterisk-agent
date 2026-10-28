@@ -516,7 +516,7 @@ stunaddr=$stun}"
   fi
   if elsewhere "$ASTERISK_DIR/rtp.conf" icehost '^\[ice_host_candidates\]'; then
     # what is already mapped is the address the router forwards audio to: trust it over a guess from the internet
-    local mapped; mapped="$(strip_block "$ASTERISK_DIR/rtp.conf" icehost | awk '/^\[ice_host_candidates\]/ {on=1; next} /^\[/ {on=0} on' | sed -n "s/^[[:space:]]*$lip[[:space:]]*=>[[:space:]]*\([0-9.]*\).*/\1/p" | head -1)"
+    local mapped; mapped="$(awk '/^\[ice_host_candidates\]/ {on=1; next} /^\[/ {on=0} on' "$ASTERISK_DIR/rtp.conf" | sed -n "s/^[[:space:]]*$lip[[:space:]]*=>[[:space:]]*\([0-9.]*\).*/\1/p" | head -1)"
     if [ -n "$mapped" ]; then
       say "rtp.conf already maps $lip => $mapped in [ice_host_candidates]; kept (audio uses $mapped)"
       PUBLIC_IP="$mapped"
