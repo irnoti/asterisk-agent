@@ -108,6 +108,8 @@ The agent is installed on a machine the customer controls, so its code is visibl
 
 ## Browser phone (PJSIP over WSS)
 
+The script needs **no options** on a typical PBX: without `--cert` it assumes a CDN/proxy ends TLS, binds Asterisk's HTTP to `127.0.0.1`, writes the Apache `/ws` proxy, finds the public IP when the PBX is behind NAT, keeps `chan_sip` working, tests and repairs how Asterisk reads whole numbers from the database (MySQL Connector/ODBC 5.3 returns `0` for integers on some builds, which makes Asterisk refuse the endpoint), opens the RTP range in the PBX's own firewall and restarts Asterisk. At the end it prints the one thing it cannot do from the PBX: the UDP forward on your router.
+
 The platform's in-page phone (`/panel/voip/softphone`) lets a customer call and answer from the browser. The browser registers a PJSIP account over **WSS** (SIP over a secure WebSocket) with JsSIP, and the platform creates those accounts through ARI. The agent itself does not set any of this up, so the PBX needs a few extra things: an HTTPS listener for the WebSocket, a `transport-wss`, PJSIP configuration stored in a database (*realtime*), and ICE for the audio path. `scripts/pjsip-webrtc-setup.sh` does all of it in one go.
 
 Skip this whole section if you do not use the browser phone: calls, IVR, campaigns and prompts work without it.
@@ -119,8 +121,8 @@ Skip this whole section if you do not use the browser phone: calls, IVR, campaig
   - **Asterisk ends TLS** (`--cert`/`--key`): a certificate the browser trusts for the domain (full chain + private key, PEM). A self-signed or CDN "origin" certificate is not trusted when the browser connects directly.
   - **A CDN or reverse proxy ends TLS** (`--behind-proxy`): no certificate on the PBX. The browser connects to `wss://your-domain/ws`, the CDN opens it and passes a plain WebSocket to the PBX (see below).
 - MySQL/MariaDB on the PBX (or reachable from it) and a MySQL/MariaDB **ODBC driver** registered (`odbcinst -q -d`).
-- `python3` and outbound HTTPS to `downloads.asterisk.org` (the script downloads Asterisk's own database migrations); or pass `--ast-source DIR` with a source tree.
-- On **Asterisk 16, `chan_sip` must not be loaded.** `chan_sip` claims the WebSocket protocol name `sip`, so PJSIP's WebSocket transport (`res_pjsip_transport_websocket`) refuses to start while it is loaded. The signature in `/var/log/asterisk/full` is `Registered SIP service WebSocket Transport Module` immediately followed by `Unregistered SIP service WebSocket Transport Module`. Disabling `chan_sip` stops every extension and trunk that uses it (typical on Issabel/Elastix), so do it on a test PBX, after moving them to PJSIP, or use a separate Asterisk for IRNoti. Asterisk 20+ no longer ships `chan_sip`.
+- Nothing else to install for the tables: the script downloads a **prebuilt, checksum-pinned** SQL file for your Asterisk version from this repository (`scripts/pjsip-schema/`, raw.githubusercontent.com). Only if none exists for your version does it fall back to Asterisk's own migrations, which need `python3` with `venv`/`pip` and access to `downloads.asterisk.org`.
+- On **Asterisk 16, `chan_sip` claims the WebSocket protocol name `sip`**, so PJSIP's WebSocket transport (`res_pjsip_transport_websocket`) refuses to start while `chan_sip` has it. The signature in `/var/log/asterisk/full` is `Registered SIP service WebSocket Transport Module` immediately followed by `Unregistered SIP service WebSocket Transport Module`. You do **not** need to unload `chan_sip`: the script sets `websocket_enabled=no` for it (in `sip_general_custom.conf`, or under `[general]` in `sip.conf`), so your `chan_sip` extensions and trunks (typical on Issabel/Elastix) keep working and PJSIP gets the protocol. `--disable-chan-sip` (`noload => chan_sip.so`) is a last resort that stops every `chan_sip` extension and trunk. Asterisk 20+ no longer ships `chan_sip`.
 
 ### Run it
 
@@ -129,8 +131,10 @@ Always look first. `--check` and `--dry-run` change nothing:
 ```bash
 curl -fsSLO https://raw.githubusercontent.com/irnoti/asterisk-agent/main/scripts/pjsip-webrtc-setup.sh
 sudo bash pjsip-webrtc-setup.sh --check
-sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem --disable-chan-sip --dry-run
-sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem --disable-chan-sip --restart
+sudo bash pjsip-webrtc-setup.sh --dry-run     # show everything it would do
+sudo bash pjsip-webrtc-setup.sh               # do it (no options needed)
+# only when Asterisk itself ends TLS:
+sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.pem
 ```
 
 | Option | Meaning |
@@ -139,13 +143,18 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 | `--tls-port N` | With `--cert`: HTTPS/WSS port (default `8089`). |
 | `--behind-proxy` | TLS ends at a CDN/proxy. No certificate needed; excludes `--cert/--key`. Configures a plain `transport-ws`, checks that Asterisk's HTTP server is on `127.0.0.1` (ARI must stay private) and prints the proxy snippet. |
 | `--proxy-port N` | With `--behind-proxy`: port the proxy listens on for the CDN (default `8080`). |
-| `--disable-chan-sip` | Adds `noload => chan_sip.so` (see above). |
+| `--disable-chan-sip` | Adds `noload => chan_sip.so`. Not needed normally (see above); it stops every `chan_sip` extension and trunk. |
 | `--db-name`, `--db-user`, `--db-pass` | Database and user for the PJSIP tables (default `irnoti_pjsip`; the password is generated when omitted). Only letters, digits, `_`, `.`, `-`. |
 | `--mysql-root-pass` | MySQL root password. Otherwise it is read from `/etc/issabel.conf` if present, then a plain `root` login is tried. |
 | `--skip-db` | Do not create the database or tables (they exist); only wire ODBC and the config files. |
-| `--ast-source DIR` | Use this Asterisk source tree for `contrib/ast-db-manage` instead of downloading it. |
+| `--schema-sql FILE` | Create the tables from this SQL file instead of the prebuilt one (it may only contain table creation; anything else is refused because it runs as the database root). |
+| `--no-prebuilt-schema` | Do not download the prebuilt file; run Asterisk's migrations on this PBX (needs `python3`). |
+| `--ast-source DIR` | With the migrations: use this Asterisk source tree for `contrib/ast-db-manage` instead of downloading it. |
+| `--public-ip IP`, `--local-ip IP` | The PBX is behind a one-to-one NAT (port forwards): ICE then offers this public address instead of the private one (`[ice_host_candidates]` in `rtp.conf`). `--local-ip` defaults to the address of the default route. Use it instead of `--stun`. |
 | `--stun HOST:PORT` | STUN server for ICE (`rtp.conf`). |
-| `--restart` | Restart Asterisk at the end. `noload` and the realtime mapping only take effect after a restart (a reload is not enough). |
+| `--no-restart` | Do not restart Asterisk at the end. The default is to restart (the realtime mapping and `websocket_enabled` only take effect after a restart; a reload is not enough); calls in progress are dropped. |
+| `--no-proxy-setup` | With `--behind-proxy`, do not write the Apache `/ws` proxy (`/etc/httpd/conf.d/irnoti-ws.conf`); the snippets are printed instead. |
+| `--no-firewall` | Do not open the RTP range (UDP) in this PBX's own firewall (firewalld, ufw, iptables). |
 | `--check` | Report the state (Asterisk version, module states, transports, ODBC); change nothing. |
 | `--dry-run` | Print every step; change nothing. |
 
@@ -153,7 +162,7 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 
 | Step | Where | Change |
 |---|---|---|
-| 1. `chan_sip` | `modules.conf` | With `--disable-chan-sip`: `noload => chan_sip.so`. Without it, a warning if `chan_sip` is running. |
+| 1. `chan_sip` | `sip_general_custom.conf` (or `sip.conf`) | `websocket_enabled=no`, so `chan_sip` stays loaded but leaves the `sip` WebSocket protocol to PJSIP. Removes the `noload` block an earlier run or `--disable-chan-sip` added. |
 | 2. HTTPS *(with `--behind-proxy`: proxy check instead)* | `http.conf`, `keys/irnoti/` | `tlsenable`, `tlsbindaddr=0.0.0.0:<port>`, certificate and key (copied to `/etc/asterisk/keys/irnoti/`, key readable by Asterisk only). An existing `tlsenable` is left alone and reported. |
 | 3. Transport | `pjsip_irnoti_wss.conf` (`..._ws.conf` behind a proxy), included from `pjsip_custom.conf` (or `pjsip.conf`) | `[transport-wss]` with `protocol=wss` (`[transport-ws]` with `protocol=ws` behind a proxy). |
 | 4. ICE | `rtp.conf` | `icesupport=yes` (+ `stunaddr`). |
@@ -162,6 +171,14 @@ sudo bash pjsip-webrtc-setup.sh --cert /root/fullchain.pem --key /root/privkey.p
 | 7. Realtime | `sorcery.conf`, `extconfig.conf` | PJSIP `endpoint`/`auth`/`aor` come from **both** `pjsip.conf` (existing trunks keep working) and the database (accounts the platform creates). |
 
 Anything already configured by hand is left untouched and listed under "Needs your attention" at the end.
+
+### Table schema (prebuilt)
+
+The `ps_*` tables must match what the running Asterisk reads and writes, so they come from Asterisk's own alembic migrations (`contrib/ast-db-manage`). Those are generated **in advance** (alembic's offline mode, no database involved) and kept in `scripts/pjsip-schema/`, one file per Asterisk version: `ps-schema-16.7.0.sql`, `16.30.1`, `18.26.4`, `20.21.0`, `22.11.0`. The setup script picks the file for your version (exact match, else the newest of your major, which is a superset of older releases), downloads it, checks it against the SHA-256 pinned inside the script, and refuses anything that is not table creation before loading it as the database root. The PBX needs no python and no copy of Asterisk's source.
+
+- A version without a file (for example another major) falls back to running the migrations on the PBX (needs `python3`; the script prepares the tools **before** it changes any file).
+- Add a version: `scripts/gen-pjsip-schema.sh 22.12.0` (needs git and python 3.8-3.11), then put the printed sha256 in `schema_hash()` and the version in `schema_latest()` of the setup script. `go test ./...` fails if a pin and its file disagree.
+- Your own SQL (generated elsewhere, or edited): `--schema-sql FILE`. Mirror the files: set `IRNOTI_SCHEMA_BASE` to your URL.
 
 ### TLS ended by a CDN (`--behind-proxy`)
 
@@ -173,6 +190,7 @@ browser <==== audio: DTLS-SRTP over UDP, straight to the PBX's public IP (never 
 - Asterisk serves `/ari` and `/ws` from the **same** HTTP server, so never open it to the network. Keep `bindaddr=127.0.0.1` and put a small proxy in front that forwards **only** `/ws` (the script prints an nginx snippet and warns if Asterisk is bound elsewhere).
 - Allow the proxy port only from the CDN's address ranges. Cloudflare reaches an origin over HTTP only on ports 80, 8080, 8880, 2052, 2082, 2086, 2095; WebSockets must be enabled for the zone.
 - The audio does not go through the CDN: the PBX needs a public IP with the RTP range (`rtp.conf`) open, plus `external_media_address`/`external_signaling_address` on the transport if it is behind NAT.
+- **Behind NAT** (a router forwarding ports to the PBX): forward the proxy port (default 8080/tcp, from the CDN's addresses only) and the RTP range from `rtp.conf` (UDP) to the PBX, and run the script with `--public-ip <public IPv4>`, otherwise an outside browser is offered the private address and the audio never connects. Do not forward Asterisk's own HTTP/HTTPS ports (8088/8089): they also serve `/ari`.
 - In the platform admin set `sipWsUrl` to `wss://pbx.example.com/ws` (no port) and `sipTransport` to `transport-ws`, because Asterisk sees a plain WebSocket.
 
 ### Safety
@@ -184,7 +202,7 @@ browser <==== audio: DTLS-SRTP over UDP, straight to the PBX's public IP (never 
 
 ### Undo
 
-Delete the `irnoti-pjsip` blocks (or restore the files from the backup directory), remove the `noload` block to bring `chan_sip` back, and restart Asterisk. The database is separate and can be dropped (`DROP DATABASE irnoti_pjsip`).
+Delete the `irnoti-pjsip` blocks (or restore the files from the backup directory), remove the `websocket_enabled=no` block (and any `noload` block), and restart Asterisk. The database is separate and can be dropped (`DROP DATABASE irnoti_pjsip`).
 
 ### After it ran
 
