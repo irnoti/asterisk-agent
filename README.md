@@ -17,7 +17,37 @@ The agent contains **no business logic**. Pricing, call-duration limits, routing
 
 The binary is statically linked and has no runtime dependencies, so it also runs on old CentOS-based FreePBX/Issabel images.
 
-## Install
+## Guided setup (recommended)
+
+One command, whether or not Asterisk is already on the server:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/irnoti/asterisk-agent/main/scripts/install.sh | sudo bash
+```
+
+The wizard looks at the server (OS, RAM, public IP, NAT, Asterisk, FreePBX/Issabel), shows what it found, and then asks only what it cannot work out itself:
+
+| You have | The wizard offers |
+|---|---|
+| **Asterisk already running** | *Connect* — writes only the IRNoti blocks (exactly what `install` does), keeps your trunks and extensions. |
+| **Nothing yet** | *Set everything up* — installs Asterisk (distribution packages on Debian/Ubuntu, or Asterisk 22 LTS built from source), the SIP trunk (register with user/password, or IP-based), RTP range and NAT addresses, firewall rules, optionally the browser phone, and connects the agent. |
+| **FreePBX / Issabel** | *Connect* only — the panel owns the SIP configuration, so the wizard does not write PJSIP there. |
+
+Along the way it checks your token with the platform before changing anything, shows a review card, and runs the steps with a live progress view. All configuration is written in one transaction with backups; if Asterisk rejects it, or PJSIP does not actually load the trunk, **everything is rolled back**. `--dry-run` shows the files it would write.
+
+Things it handles that are easy to get wrong by hand: it unloads `chan_sip` when that driver holds UDP 5060 (or moves PJSIP to 5070 when `chan_sip` has peers), puts the RTP range where Asterisk really reads it, and restarts an idle Asterisk so the range takes effect.
+
+Unattended (CI, provisioning tools) — every question has a flag:
+
+```bash
+sudo irnoti-asterisk setup --yes --mode full --api https://api.example.com --token irna_xxx \
+  --trunk-auth register --trunk-host sip.provider.ir --trunk-user USER --trunk-pass PASS --trunk-ips 198.51.100.5 \
+  --public-ip 203.0.113.7 --rtp-start 10000 --rtp-end 10199 [--softphone --tls proxy --domain pbx.example.com]
+```
+
+Build-from-source needs systemd and takes 10–30 minutes; the package install takes about a minute. The wizard needs root.
+
+## Install (existing Asterisk, scripted)
 
 1. In the IRNoti admin panel (`/admin/voip`, section "Asterisk agents") create a new agent. You get an install command; the token is shown **once**.
 2. Run the command on the Asterisk server as root:
@@ -71,6 +101,7 @@ After writing, the agent runs `module reload http`, `module reload res_ari.so` a
 ## Commands
 
 ```
+irnoti-asterisk setup     [--dry-run] [--yes] [--mode connect|full] [...flags]   # guided installer, see above
 irnoti-asterisk install   --api URL --token TOKEN [--asterisk-dir DIR] [--extensions-file FILE]
                           [--config FILE] [--no-service] [--dry-run]
 irnoti-asterisk run       [--config FILE]       # the daemon (started by systemd)

@@ -23,6 +23,7 @@ import (
 const usage = `irnoti-asterisk %s
 
 Usage:
+  irnoti-asterisk setup     [--dry-run] [--yes ...]    (guided installer: connect Asterisk, or install and configure everything)
   irnoti-asterisk install   --api URL --token TOKEN [--asterisk-dir DIR] [--extensions-file FILE] [--no-service] [--dry-run]
   irnoti-asterisk run       [--config FILE]            (the daemon; installed as a systemd service)
   irnoti-asterisk status    [--config FILE]
@@ -42,6 +43,8 @@ func main() {
 
 	var err error
 	switch os.Args[1] {
+	case "setup":
+		err = cmdSetup(ctx, log, os.Args[2:])
 	case "install":
 		err = cmdInstall(ctx, log, os.Args[2:])
 	case "run":
