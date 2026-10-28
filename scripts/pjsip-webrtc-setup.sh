@@ -101,7 +101,7 @@ detect_public_ip() { # only when behind NAT and nothing was given
     [[ "$pub" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]] && break || pub=""
   done
   if [ -n "$pub" ] && ! is_private "$pub"; then
-    PUBLIC_IP="$pub"; say "this PBX is behind NAT ($lip); its public address is $PUBLIC_IP (override with --public-ip)"
+    PUBLIC_IP="$pub"; say "this PBX is behind NAT ($lip); the address it reaches the internet from is $PUBLIC_IP (override with --public-ip if your router has several public IPs and audio is forwarded to another one)"
   else
     warn "this PBX is on a private address ($lip) and its public address could not be found: pass --public-ip, or the browser cannot reach the audio"
     MANUAL+=("run again with --public-ip YOUR.PUBLIC.IP (browsers need it to send audio to this PBX)")
@@ -515,7 +515,14 @@ stunaddr=$stun}"
     return 0
   fi
   if elsewhere "$ASTERISK_DIR/rtp.conf" icehost '^\[ice_host_candidates\]'; then
-    warn "rtp.conf already has [ice_host_candidates]; left alone"; MANUAL+=("rtp.conf: map $lip => $PUBLIC_IP in [ice_host_candidates]")
+    # what is already mapped is the address the router forwards audio to: trust it over a guess from the internet
+    local mapped; mapped="$(awk '/^\[ice_host_candidates\]/ {on=1; next} /^\[/ {on=0} on' "$ASTERISK_DIR/rtp.conf" | sed -n "s/^[[:space:]]*$lip[[:space:]]*=>[[:space:]]*\([0-9.]*\).*/\1/p" | head -1)"
+    if [ -n "$mapped" ]; then
+      say "rtp.conf already maps $lip => $mapped in [ice_host_candidates]; kept (audio uses $mapped)"
+      PUBLIC_IP="$mapped"
+    else
+      warn "rtp.conf has [ice_host_candidates] but no line for $lip; left alone"; MANUAL+=("rtp.conf: map $lip => <public IP your router forwards audio to> in [ice_host_candidates]")
+    fi
     return 0
   fi
   set_block "$ASTERISK_DIR/rtp.conf" icehost ice_host_candidates "$lip => $PUBLIC_IP"
