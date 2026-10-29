@@ -24,15 +24,18 @@ import (
 )
 
 const (
-	IncludeDir    = "irnoti"
-	ariFile       = "ari_irnoti.conf"
-	dialplanFile  = "extensions_irnoti.conf"
-	BackupRoot    = "/var/lib/irnoti-asterisk/backups"
-	maxFiles      = 10
-	maxFileBytes  = 128 << 10
-	tagARI        = "ari"
-	tagHTTP       = "http"
-	tagDialplan   = "dialplan"
+	IncludeDir   = "irnoti"
+	ariFile      = "ari_irnoti.conf"
+	dialplanFile = "extensions_irnoti.conf"
+	BackupRoot   = "/var/lib/irnoti-asterisk/backups"
+	maxFiles     = 10
+	maxFileBytes = 128 << 10
+	tagARI       = "ari"
+	tagHTTP      = "http"
+	tagDialplan  = "dialplan"
+	// TagPJSIP and TagRTP mark the blocks the setup wizard adds to pjsip.conf (or pjsip_custom.conf) and rtp.conf.
+	TagPJSIP      = "pjsip"
+	TagRTP        = "rtp"
 	manifestName  = "manifest.json"
 	systemdUnit   = "/etc/systemd/system/irnoti-asterisk.service"
 	defaultBinary = "/usr/local/bin/irnoti-asterisk"
@@ -63,6 +66,16 @@ type Installer struct {
 	Binary     string
 	DryRun     bool
 	NoService  bool
+	// Extra files are written in the same transaction as the install (one backup, one reload, one rollback); the setup wizard uses it for PJSIP and RTP.
+	Extra []FileWrite
+	// ExtraReload are further `asterisk -rx` commands run after the standard reload, e.g. "module reload res_pjsip.so".
+	ExtraReload []string
+	// BeforeReload runs after the files are written and before Asterisk reloads (e.g. free a port another module holds). OnRollback undoes it
+	// when the install is rolled back. ExtraVerify is a second check, after ARI answers, that the extra configuration really loaded:
+	// `module reload` reports success even when PJSIP rejected an object.
+	BeforeReload func(ctx context.Context) error
+	OnRollback   func(ctx context.Context)
+	ExtraVerify  func(ctx context.Context) error
 	// Verify checks that ARI answers with the agent's credentials after the reload.
 	Verify func(ctx context.Context) error
 	Now    func() time.Time
@@ -171,6 +184,12 @@ func readOrEmpty(path string) (string, error) {
 }
 
 // plan is the set of file writes an install makes; applying it and dry-running it share the same list.
+type FileWrite struct {
+	Path    string
+	Content string
+	Mode    os.FileMode
+}
+
 type write struct {
 	path    string
 	content string
@@ -220,12 +239,16 @@ func (in *Installer) Install(ctx context.Context, bundle api.Bundle) error {
 		in.Cfg.ARIURL = ariURLFrom(RemoveBlock(httpConf, tagHTTP))
 	} else {
 		in.Cfg.ARIURL = config.DefaultARIURL
-		writes = append(writes, write{in.path("http.conf"), UpsertBlock(httpConf, tagHTTP, "[general]\nenabled=yes\nbindaddr=127.0.0.1\nbindport=8088"), 0o644})
+		writes = append(writes, write{in.path("http.conf"), InsertInSection(httpConf, "general", tagHTTP, "enabled=yes\nbindaddr=127.0.0.1\nbindport=8088"), 0o644})
 	}
 	for _, f := range bundle.Files {
 		if f.Name == dialplanFile {
 			writes = append(writes, write{extPath, UpsertBlock(extConf, tagDialplan, fmt.Sprintf("#include \"%s/%s\"", IncludeDir, dialplanFile)), 0o644})
 		}
+	}
+
+	for _, f := range in.Extra {
+		writes = append(writes, write{f.Path, f.Content, f.Mode})
 	}
 
 	if in.DryRun {
@@ -240,16 +263,33 @@ func (in *Installer) Install(ctx context.Context, bundle api.Bundle) error {
 		in.rollbackManifest(man)
 		return err
 	}
-	if err := in.reload(ctx); err != nil {
+	undo := func() {
 		in.rollbackManifest(man)
+		if in.OnRollback != nil {
+			in.OnRollback(ctx)
+		}
 		_ = in.reload(ctx)
+	}
+	if in.BeforeReload != nil {
+		if err := in.BeforeReload(ctx); err != nil {
+			undo()
+			return fmt.Errorf("could not prepare Asterisk for the new configuration (rolled back): %w", err)
+		}
+	}
+	if err := in.reload(ctx); err != nil {
+		undo()
 		return fmt.Errorf("Asterisk did not accept the configuration (rolled back): %w", err)
 	}
 	if in.Verify != nil {
 		if err := in.Verify(ctx); err != nil {
-			in.rollbackManifest(man)
-			_ = in.reload(ctx)
+			undo()
 			return fmt.Errorf("ARI did not come up with the agent's credentials (rolled back): %w", err)
+		}
+	}
+	if in.ExtraVerify != nil {
+		if err := in.ExtraVerify(ctx); err != nil {
+			undo()
+			return fmt.Errorf("the configuration loaded but is not working (rolled back): %w", err)
 		}
 	}
 	if err := config.Save(in.ConfigPath, in.Cfg); err != nil {
@@ -332,7 +372,7 @@ func (in *Installer) rollbackManifest(dir string) {
 }
 
 func (in *Installer) reload(ctx context.Context) error {
-	for _, cmd := range []string{"module reload http", "module reload res_ari.so", "dialplan reload"} {
+	for _, cmd := range append([]string{"module reload http", "module reload res_ari.so", "dialplan reload"}, in.ExtraReload...) {
 		if out, err := in.Runner.Run(ctx, "asterisk", "-rx", cmd); err != nil {
 			return fmt.Errorf("%q: %v %s", cmd, err, out)
 		}
@@ -382,7 +422,8 @@ func (in *Installer) Rollback(ctx context.Context) error {
 
 // Uninstall removes the managed blocks and the irnoti/ directory, reloads Asterisk and stops the service.
 func (in *Installer) Uninstall(ctx context.Context, purge bool) error {
-	for _, f := range []struct{ file, tag string }{{in.path("ari.conf"), tagARI}, {in.path("http.conf"), tagHTTP}, {in.extensionsFile(), tagDialplan}} {
+	for _, f := range []struct{ file, tag string }{{in.path("ari.conf"), tagARI}, {in.path("http.conf"), tagHTTP}, {in.extensionsFile(), tagDialplan},
+		{in.path("pjsip.conf"), TagPJSIP}, {in.path("pjsip_custom.conf"), TagPJSIP}, {in.path("rtp.conf"), TagRTP}} {
 		cur, err := readOrEmpty(f.file)
 		if err != nil || !HasBlock(cur, f.tag) {
 			continue
