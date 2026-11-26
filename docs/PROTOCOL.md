@@ -39,7 +39,7 @@ Only requests the platform itself makes are forwarded (see `internal/proxy/allow
 | Area | Allowed |
 |---|---|
 | Server info | `GET /asterisk/info` |
-| Channels | `GET/POST /channels`, `GET/DELETE /channels/{id}`, `POST /channels/{id}/{answer,play,record,snoop,continue,redirect,hold,ring,dtmf}`, `DELETE /channels/{id}/hold` |
+| Channels | `GET/POST /channels`, `POST /channels/externalMedia` (live-call media link only: `app`, `external_host=host:port` with port ≥ 1024, `format=ulaw|alaw`, optional `channelId`, `encapsulation=rtp`, `transport=udp`, `connection_type=client`, `direction=both`; anything else is refused), `GET/DELETE /channels/{id}`, `POST /channels/{id}/{answer,play,record,snoop,continue,redirect,hold,ring,dtmf}`, `DELETE /channels/{id}/hold` |
 | Bridges | `GET/POST /bridges`, `DELETE /bridges/{id}`, `POST /bridges/{id}/{addChannel,removeChannel,record}` |
 | Playbacks | `DELETE /playbacks/{id}` |
 | Recordings | `POST /recordings/live/{name}/stop`, `GET /recordings/stored/{name}/file`, `DELETE /recordings/stored/{name}` |

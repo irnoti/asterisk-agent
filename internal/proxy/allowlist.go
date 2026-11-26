@@ -4,12 +4,15 @@ package proxy
 import (
 	"net/url"
 	"regexp"
+	"strconv"
 	"strings"
 )
 
 type rule struct {
 	method string
 	path   *regexp.Regexp
+	// query, when set, must accept the request's query too: a path alone is too wide for calls that can redirect media.
+	query func(url.Values) bool
 }
 
 const id = `[A-Za-z0-9_.:@%+-]{1,200}`
@@ -18,12 +21,54 @@ func r(method, pattern string) rule {
 	return rule{method: method, path: regexp.MustCompile("^" + pattern + "$")}
 }
 
+var externalHost = regexp.MustCompile(`^([A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*:([0-9]{4,5})$`)
+
+// externalMediaOK lets the platform open a live-call media link and nothing else: RTP over UDP in G.711, towards a plain
+// host:port (no scheme, no path, no credentials) on an unprivileged port. Every other externalMedia option is refused, so the
+// call cannot be turned into an audio tap with an exotic encapsulation or a server-side connection.
+func externalMediaOK(q url.Values) bool {
+	allowed := map[string]bool{"app": true, "external_host": true, "format": true, "channelId": true, "encapsulation": true, "transport": true, "connection_type": true, "direction": true}
+	for k, v := range q {
+		if !allowed[k] || len(v) != 1 {
+			return false
+		}
+	}
+	if q.Get("app") == "" || !regexp.MustCompile("^"+id+"$").MatchString(q.Get("app")) {
+		return false
+	}
+	if ch := q.Get("channelId"); ch != "" && !regexp.MustCompile("^"+id+"$").MatchString(ch) {
+		return false
+	}
+	if f := q.Get("format"); f != "ulaw" && f != "alaw" {
+		return false
+	}
+	if v := q.Get("encapsulation"); v != "" && v != "rtp" {
+		return false
+	}
+	if v := q.Get("transport"); v != "" && v != "udp" {
+		return false
+	}
+	if v := q.Get("connection_type"); v != "" && v != "client" {
+		return false
+	}
+	if v := q.Get("direction"); v != "" && v != "both" {
+		return false
+	}
+	h := q.Get("external_host")
+	if !externalHost.MatchString(h) {
+		return false
+	}
+	port, err := strconv.Atoi(h[strings.LastIndex(h, ":")+1:])
+	return err == nil && port >= 1024 && port <= 65535
+}
+
 // The API never gets a general ARI door: only the calls the platform itself makes. Everything else (event subscriptions,
 // applications, sounds, device states, asterisk modules/logging/config outside PJSIP …) is refused here, whatever the API asks.
 var rules = []rule{
 	r("GET", `/asterisk/info`),
 	r("GET", `/channels`),
 	r("POST", `/channels`),
+	{method: "POST", path: regexp.MustCompile(`^/channels/externalMedia$`), query: externalMediaOK},
 	r("GET", `/channels/`+id),
 	r("DELETE", `/channels/`+id),
 	r("POST", `/channels/`+id+`/(answer|play|record|snoop|continue|redirect|hold|ring|dtmf)`),
@@ -65,7 +110,7 @@ func Allowed(method, target string) bool {
 		return false
 	}
 	for _, rl := range rules {
-		if rl.method == method && rl.path.MatchString(p) {
+		if rl.method == method && rl.path.MatchString(p) && (rl.query == nil || rl.query(u.Query())) {
 			return true
 		}
 	}

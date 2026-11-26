@@ -11,6 +11,8 @@ func TestAllowed(t *testing.T) {
 		{"DELETE", "/channels/chan1/hold"},
 		{"POST", "/bridges/b-1/addChannel?channel=a,b"},
 		{"POST", "/bridges/b-1/record?name=call-1&format=wav"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=2.144.21.248:40000&format=ulaw&channelId=irnoti-live-c1-ext&encapsulation=rtp&transport=udp&connection_type=client&direction=both"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=api.example.com:40002&format=alaw"},
 		{"GET", "/recordings/stored/vm-1/file"},
 		{"DELETE", "/recordings/stored/vm-1"},
 		{"POST", "/recordings/live/vm-1/stop"},
@@ -41,6 +43,16 @@ func TestAllowed(t *testing.T) {
 		{"PATCH", "/channels/c1"},
 		{"POST", "/channels/c1/play/extra"},
 		{"GET", ""},
+		{"POST", "/channels/externalMedia"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=2.144.21.248:40000"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=2.144.21.248:80&format=ulaw"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=http://evil.example:40000&format=ulaw"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=2.144.21.248:40000/x&format=ulaw"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=2.144.21.248:40000&format=slin16"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=2.144.21.248:40000&format=ulaw&transport=tcp"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=2.144.21.248:40000&format=ulaw&encapsulation=audiosocket"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=2.144.21.248:40000&format=ulaw&connection_type=server"},
+		{"POST", "/channels/externalMedia?app=irnoti&external_host=2.144.21.248:40000&format=ulaw&variables=x"},
 	}
 	for _, c := range deny {
 		if c.p == "/channels" && c.m == "POST" {
